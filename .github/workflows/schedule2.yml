@@ -1,0 +1,40 @@
+name: Schedule Spark Flow
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 16 * * *"
+
+jobs:
+  schedule:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Setup Chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+
+      - name: Run task
+        env:
+          BROWSER_TIMEOUT: ${{ vars.BROWSER_TIMEOUT }}
+          FRIEND_LIST_WAIT_TIME: ${{ vars.FRIEND_LIST_WAIT_TIME }}
+          HITOKOTO_TYPES: ${{ vars.HITOKOTO_TYPES }}
+          LOG_LEVEL: ${{ vars.LOG_LEVEL }}
+          MATCH_MODE: ${{ vars.MATCH_MODE }}
+          MESSAGE_TEMPLATE: ${{ vars.MESSAGE_TEMPLATE }}
+          TASKS: ${{ vars.TASKS }}
+          TASK_RETRY_TIMES: ${{ vars.TASK_RETRY_TIMES }}
+        run: python main.py
