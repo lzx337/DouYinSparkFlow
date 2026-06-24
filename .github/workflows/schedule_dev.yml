@@ -14,7 +14,7 @@ jobs:
         with:
           ref: dev
 
-      - name: Load Cookie (手机文件优先 → Secrets 兜底)
+      - name: Load Cookie (手机文件优先 -> Secrets 兜底)
         run: |
           if [ -f .github/cookie_data.json ]; then
             echo "从 cookie_data.json 读取 Cookie"
@@ -35,28 +35,28 @@ jobs:
             exit 1
           fi
 
-      - name: 安装 Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python版本: "3.11"
+          python-version: "3.11"
 
-      - 名称: 安装Chrome
-        使用: browser-actions/setup-chrome@v1
+      - name: Setup Chrome
+        uses: browser-actions/setup-chrome@v1
 
-      - 名称: 安装依赖项
+      - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          playwright 安装 chromium
+          playwright install chromium
 
       - name: Run task
-        环境:
-          浏览器超时时间: "${{ vars.BROWSER_TIMEOUT }}"
-          好友列表等待时间: "${{ vars.FRIEND_LIST_WAIT_TIME }}"
+        env:
+          BROWSER_TIMEOUT: "${{ vars.BROWSER_TIMEOUT }}"
+          FRIEND_LIST_WAIT_TIME: "${{ vars.FRIEND_LIST_WAIT_TIME }}"
           HITOKOTO_TYPES: "${{ vars.HITOKOTO_TYPES }}"
           LOG_LEVEL: "${{ vars.LOG_LEVEL }}"
           MATCH_MODE: "${{ vars.MATCH_MODE }}"
-          消息模板: "${{ vars.MESSAGE_TEMPLATE }}"
-          任务: "${{ vars.TASKS }}"
-          任务重试次数: "${{ vars.TASK_RETRY_TIMES }}"
+          MESSAGE_TEMPLATE: "${{ vars.MESSAGE_TEMPLATE }}"
+          TASKS: "${{ vars.TASKS }}"
+          TASK_RETRY_TIMES: "${{ vars.TASK_RETRY_TIMES }}"
           PROXY_ADDRESS: "${{ vars.PROXY_ADDRESS }}"
         run: python main.py
