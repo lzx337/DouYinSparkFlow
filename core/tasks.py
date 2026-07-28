@@ -319,7 +319,7 @@ def do_user_task(browser, username, cookies, targets):
                 raise RuntimeError(f'?? {username} ????????')
 
             message = build_message()
-            lines = message.replace("\n", chr(10)).splitlines() or [message]
+            lines = message.replace("\\n", chr(10)).splitlines() or [message]
             for index, line in enumerate(lines):
                 chat_input.type(line)
                 if index != len(lines) - 1:
