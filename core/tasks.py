@@ -284,53 +284,54 @@ def scroll_and_select_user(page, username, targets, list_selector):
 
 
         def do_user_task(browser, username, cookies, targets):
-            context = browser.new_context()
-            try:
-                context.set_default_navigation_timeout(config['browserTimeout'])
-                context.set_default_timeout(config['browserTimeout'])
-                page = context.new_page()
-                page.on('response', handle_response)
-                context.add_cookies(cookies)
+    context = browser.new_context()
+    try:
+        context.set_default_navigation_timeout(config['browserTimeout'])
+        context.set_default_timeout(config['browserTimeout'])
+        page = context.new_page()
+        page.on('response', handle_response)
+        context.add_cookies(cookies)
 
-                retry_operation(
-                    '??????????',
-                    page.goto,
-                    retries=config['taskRetryTimes'],
-                    delay=5,
-                    url='https://www.douyin.com/chat',
-                    wait_until='domcontentloaded',
-                    timeout=min(config['browserTimeout'], 60000),
-                )
+        retry_operation(
+            '??????????',
+            page.goto,
+            retries=config['taskRetryTimes'],
+            delay=5,
+            url='https://www.douyin.com/chat',
+            wait_until='domcontentloaded',
+            timeout=min(config['browserTimeout'], 60000),
+        )
 
-                if '/chat' not in page.url.lower():
-                    dump_debug_artifacts(page, username, 'redirected-away-from-chat')
-                    raise RuntimeError(
-                        f'?? {username} ???????????????: {page.url}'
-                    )
+        if '/chat' not in page.url.lower():
+            dump_debug_artifacts(page, username, 'redirected-away-from-chat')
+            raise RuntimeError(
+                f'?? {username} ???????????????: {page.url}'
+            )
 
-                list_selector = wait_for_chat_ready(page, username)
-                logger.debug(f'?? {username} ??????')
+        list_selector = wait_for_chat_ready(page, username)
+        logger.debug(f'?? {username} ??????')
 
-                for target_symbol in scroll_and_select_user(page, username, targets, list_selector):
-                    logger.debug(f'?? {username} ????? {target_symbol} ????')
-                    _, chat_input = first_visible_locator(
-                        page, CHAT_EDITOR_SELECTORS, timeout=config['browserTimeout']
-                    )
-                    if chat_input is None:
-                        dump_debug_artifacts(page, username, 'chat-editor-not-found')
-                        raise RuntimeError(f'?? {username} ????????')                    message = build_message()
-                    lines = message.replace(\"\n\", chr(10)).splitlines() or [message]
-                    for index, line in enumerate(lines):
-                        chat_input.type(line)
-                        if index != len(lines) - 1:
-                            chat_input.press("Shift+Enter")
-                    logger.debug(f"Sending message to {target_symbol}:
-	{message}")
-                    chat_input.press("Enter")
-                    logger.debug(f'?? {username} ??? {target_symbol} ??????')
-                    time.sleep(2)
-            finally:
-                context.close()
+        for target_symbol in scroll_and_select_user(page, username, targets, list_selector):
+            logger.debug(f'?? {username} ????? {target_symbol} ????')
+            _, chat_input = first_visible_locator(
+                page, CHAT_EDITOR_SELECTORS, timeout=config['browserTimeout']
+            )
+            if chat_input is None:
+                dump_debug_artifacts(page, username, 'chat-editor-not-found')
+                raise RuntimeError(f'?? {username} ????????')
+
+            message = build_message()
+            lines = message.replace("\n", chr(10)).splitlines() or [message]
+            for index, line in enumerate(lines):
+                chat_input.type(line)
+                if index != len(lines) - 1:
+                    chat_input.press('Shift+Enter')
+            logger.debug(f"Sending message to {target_symbol}:\n	{message}")
+            chat_input.press('Enter')
+            logger.debug(f'?? {username} ??? {target_symbol} ??????')
+            time.sleep(2)
+    finally:
+        context.close()
 
 
 def runTasks():
