@@ -318,17 +318,15 @@ def scroll_and_select_user(page, username, targets, list_selector):
                     )
                     if chat_input is None:
                         dump_debug_artifacts(page, username, 'chat-editor-not-found')
-                        raise RuntimeError(f'?? {username} ????????')
-
-                    message = build_message()
-                    lines = message.replace('\n', chr(10)).splitlines() or [message]
+                        raise RuntimeError(f'?? {username} ????????')                    message = build_message()
+                    lines = message.replace(\"\n\", chr(10)).splitlines() or [message]
                     for index, line in enumerate(lines):
                         chat_input.type(line)
                         if index != len(lines) - 1:
-                            chat_input.press('Shift+Enter')
-                    logger.debug(f'?? {username} ????????? {target_symbol}:
-	{message}')
-                    chat_input.press('Enter')
+                            chat_input.press("Shift+Enter")
+                    logger.debug(f"Sending message to {target_symbol}:
+	{message}")
+                    chat_input.press("Enter")
                     logger.debug(f'?? {username} ??? {target_symbol} ??????')
                     time.sleep(2)
             finally:
