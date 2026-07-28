@@ -59,10 +59,46 @@ def get_config():
     return config
 
 def sanitize_cookies(cookies):
+    normalized = []
     for cookie in cookies:
-        if "sameSite" in cookie:
-            cookie.pop("sameSite")  # 移除 sameSite 字段，Playwright 可能不支持该字段
-    return cookies
+        if not isinstance(cookie, dict):
+            continue
+
+        entry = {
+            'name': cookie.get('name', ''),
+            'value': cookie.get('value', ''),
+        }
+
+        url = cookie.get('url')
+        domain = cookie.get('domain')
+        path = cookie.get('path') or '/'
+        if url:
+            entry['url'] = url
+        elif domain:
+            entry['domain'] = domain
+            entry['path'] = path
+        else:
+            entry['url'] = 'https://www.douyin.com'
+
+        if 'httpOnly' in cookie:
+            entry['httpOnly'] = bool(cookie.get('httpOnly', False))
+        if 'secure' in cookie:
+            entry['secure'] = bool(cookie.get('secure', False))
+
+        same_site = cookie.get('sameSite')
+        if same_site in ('Lax', 'Strict', 'None'):
+            entry['sameSite'] = same_site
+
+        expires = cookie.get('expires', cookie.get('expirationDate'))
+        if expires:
+            try:
+                entry['expires'] = float(expires)
+            except (TypeError, ValueError):
+                pass
+
+        normalized.append(entry)
+
+    return normalized
 
 
 def get_userData():

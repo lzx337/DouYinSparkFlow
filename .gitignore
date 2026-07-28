@@ -6,3 +6,4 @@ logs/
 .DS_Store
 usersData.json
 .env
+.github/cookie_data.json
