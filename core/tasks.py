@@ -281,9 +281,7 @@ def scroll_and_select_user(page, username, targets, list_selector):
                         f"(scrollTop: {scroll_top_before} -> {scroll_top_after})"
                     )
                 time.sleep(1.5)
-
-
-        def do_user_task(browser, username, cookies, targets):
+def do_user_task(browser, username, cookies, targets):
     context = browser.new_context()
     try:
         context.set_default_navigation_timeout(config['browserTimeout'])
@@ -332,7 +330,6 @@ def scroll_and_select_user(page, username, targets, list_selector):
             time.sleep(2)
     finally:
         context.close()
-
 
 def runTasks():
     global userIDDict
