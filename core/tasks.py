@@ -82,10 +82,22 @@ def retry_operation(name, operation, retries=3, delay=2, *args, **kwargs):
 
 
 def first_visible_locator(page, selectors, timeout=5000):
+    if not selectors:
+        return None, None
+
+    combined_selector = ', '.join(selectors)
+    if combined_selector:
+        locator = page.locator(combined_selector).first
+        try:
+            locator.wait_for(state='visible', timeout=timeout)
+            return combined_selector, locator
+        except PlaywrightTimeoutError:
+            pass
+
     for selector in selectors:
         locator = page.locator(selector).first
         try:
-            locator.wait_for(state="visible", timeout=timeout)
+            locator.wait_for(state='visible', timeout=timeout)
             return selector, locator
         except PlaywrightTimeoutError:
             continue
@@ -118,39 +130,41 @@ def dump_debug_artifacts(page, username, reason):
 
 def wait_for_chat_ready(page, username):
     try:
-        page.wait_for_load_state("domcontentloaded", timeout=30000)
+        page.wait_for_load_state('domcontentloaded', timeout=30000)
     except PlaywrightTimeoutError:
-        logger.warning(f"账号 {username} 等待 DOMContentLoaded 超时，继续检查页面")
+        logger.warning(f'?? {username} ?? DOMContentLoaded ?????????')
 
-    try:
-        page.wait_for_load_state("networkidle", timeout=15000)
-    except PlaywrightTimeoutError:
-        logger.debug(f"账号 {username} networkidle 超时，可能是抖音长连接导致，继续检查页面")
+    current_url = page.url.lower()
+    if '/chat' not in current_url:
+        dump_debug_artifacts(page, username, 'not-on-chat-page')
+        raise RuntimeError(
+            f'?? {username} ???????????????: {page.url}'
+        )
 
-    list_selector, _ = first_visible_locator(page, CONVERSATION_LIST_SELECTORS, timeout=15000)
+    list_selector, _ = first_visible_locator(page, CONVERSATION_LIST_SELECTORS, timeout=10000)
     if list_selector:
-        logger.debug(f"账号 {username} 聊天列表已加载，选择器: {list_selector}")
+        logger.debug(f'?? {username} ???????????: {list_selector}')
         return list_selector
 
-    title = ""
-    body_text = ""
+    title = ''
+    body_text = ''
     try:
         title = page.title()
-        body_text = page.locator("body").inner_text(timeout=3000)[:500]
+        body_text = page.locator('body').inner_text(timeout=3000)[:500]
     except Exception:
         pass
 
-    dump_debug_artifacts(page, username, "chat-list-not-found")
+    dump_debug_artifacts(page, username, 'chat-list-not-found')
 
-    if "login" in page.url.lower() or "登录" in body_text or "验证码" in body_text:
+    if 'login' in page.url.lower() or '??' in body_text or '???' in body_text:
         raise RuntimeError(
-            f"账号 {username} 未进入聊天列表，疑似 Cookie 失效或需要验证登录。"
-            "请重新获取 Cookie 后再运行。"
+            f'?? {username} ?????????? Cookie ??????????'
+            '????? Cookie ?????'
         )
 
     raise RuntimeError(
-        f"账号 {username} 未找到聊天列表。页面标题: {title!r}，"
-        f"页面文本片段: {body_text!r}"
+        f'?? {username} ????????????: {title!r}?'
+        f'??????: {body_text!r}'
     )
 
 
@@ -269,70 +283,81 @@ def scroll_and_select_user(page, username, targets, list_selector):
                 time.sleep(1.5)
 
 
-def do_user_task(browser, username, cookies, targets):
-    context = browser.new_context()
-    try:
-        context.set_default_navigation_timeout(config["browserTimeout"])
-        context.set_default_timeout(config["browserTimeout"])
-        page = context.new_page()
-        page.on("response", handle_response)
-        context.add_cookies(cookies)
+        def do_user_task(browser, username, cookies, targets):
+            context = browser.new_context()
+            try:
+                context.set_default_navigation_timeout(config['browserTimeout'])
+                context.set_default_timeout(config['browserTimeout'])
+                page = context.new_page()
+                page.on('response', handle_response)
+                context.add_cookies(cookies)
 
-        retry_operation(
-            "打开抖音网页聊天页面",
-            page.goto,
-            retries=config["taskRetryTimes"],
-            delay=5,
-            url="https://www.douyin.com/chat",
-            wait_until="domcontentloaded",
-            timeout=min(config["browserTimeout"], 60000),
-        )
+                retry_operation(
+                    '??????????',
+                    page.goto,
+                    retries=config['taskRetryTimes'],
+                    delay=5,
+                    url='https://www.douyin.com/chat',
+                    wait_until='domcontentloaded',
+                    timeout=min(config['browserTimeout'], 60000),
+                )
 
-        list_selector = wait_for_chat_ready(page, username)
-        logger.debug(f"账号 {username} 开始发送消息")
+                if '/chat' not in page.url.lower():
+                    dump_debug_artifacts(page, username, 'redirected-away-from-chat')
+                    raise RuntimeError(
+                        f'?? {username} ???????????????: {page.url}'
+                    )
 
-        for target_symbol in scroll_and_select_user(page, username, targets, list_selector):
-            logger.debug(f"账号 {username} 已选中好友 {target_symbol} 发送消息")
-            _, chat_input = first_visible_locator(
-                page, CHAT_EDITOR_SELECTORS, timeout=config["browserTimeout"]
-            )
-            if chat_input is None:
-                dump_debug_artifacts(page, username, "chat-editor-not-found")
-                raise RuntimeError(f"账号 {username} 未找到聊天输入框")
+                list_selector = wait_for_chat_ready(page, username)
+                logger.debug(f'?? {username} ??????')
 
-            message = build_message()
-            lines = message.replace("\\\\n", chr(10)).splitlines() or [message]
-            for index, line in enumerate(lines):
-                chat_input.type(line)
-                if index != len(lines) - 1:
-                    chat_input.press("Shift+Enter")
-            logger.debug(f"账号 {username} 准备发送消息给好友 {target_symbol}：\n\t{message}")
-            chat_input.press("Enter")
-            logger.debug(f"账号 {username} 给好友 {target_symbol} 发送消息完成")
-            time.sleep(2)
-    finally:
-        context.close()
+                for target_symbol in scroll_and_select_user(page, username, targets, list_selector):
+                    logger.debug(f'?? {username} ????? {target_symbol} ????')
+                    _, chat_input = first_visible_locator(
+                        page, CHAT_EDITOR_SELECTORS, timeout=config['browserTimeout']
+                    )
+                    if chat_input is None:
+                        dump_debug_artifacts(page, username, 'chat-editor-not-found')
+                        raise RuntimeError(f'?? {username} ????????')
+
+                    message = build_message()
+                    lines = message.replace('\n', chr(10)).splitlines() or [message]
+                    for index, line in enumerate(lines):
+                        chat_input.type(line)
+                        if index != len(lines) - 1:
+                            chat_input.press('Shift+Enter')
+                    logger.debug(f'?? {username} ????????? {target_symbol}:
+	{message}')
+                    chat_input.press('Enter')
+                    logger.debug(f'?? {username} ??? {target_symbol} ??????')
+                    time.sleep(2)
+            finally:
+                context.close()
 
 
 def runTasks():
+    global userIDDict
+    if not userData:
+        raise RuntimeError('??????????????? TASKS ? cookies_* ????')
+
     playwright, browser = get_browser()
     try:
-        logger.info("开始执行任务")
-        logger.debug("当前配置如下：")
-        logger.debug(f"消息模板: {config.get('messageTemplate', '未找到消息模板')}")
-        logger.debug(f"一言类型: {config['hitokotoTypes']}")
+        logger.info('??????')
+        logger.debug('???????')
+        logger.debug(f"????: {config.get('messageTemplate', '???????')}")
+        logger.debug(f"????: {config['hitokotoTypes']}")
         for user in userData:
             logger.debug(
-                f"用户: {user.get('username', '未知用户')}, 目标好友: {user['targets']}"
+                f"??: {user.get('username', '????')}, ????: {user['targets']}"
             )
         for user in userData:
-            cookies = user["cookies"]
-            targets = user["targets"]
-            username = user.get("username", "未知用户")
-            logger.info(f"开始处理账号 {username}")
+            userIDDict = {}
+            cookies = user['cookies']
+            targets = user['targets']
+            username = user.get('username', '????')
+            logger.info(f'?????? {username}')
             do_user_task(browser, username, cookies, targets)
-            logger.info(f"账号 {username} 任务完成")
+            logger.info(f'?? {username} ????')
     finally:
         browser.close()
         playwright.stop()
-
