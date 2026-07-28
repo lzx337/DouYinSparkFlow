@@ -31,7 +31,7 @@ jobs:
               echo "EOF"
             } >> $GITHUB_ENV
           else
-            echo "没有找到任何 Cookie 来源！"
+            echo "没有找到任何 Cookie 来源"
             exit 1
           fi
 
@@ -60,3 +60,11 @@ jobs:
           TASK_RETRY_TIMES: "${{ vars.TASK_RETRY_TIMES }}"
           PROXY_ADDRESS: "${{ vars.PROXY_ADDRESS }}"
         run: python main.py
+
+      - name: Upload debug logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-logs
+          path: logs/
+          if-no-files-found: ignore
