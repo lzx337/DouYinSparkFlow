@@ -450,6 +450,42 @@ def log_visible_conversation_titles(page, username, item_selector, limit=15):
     logger.info(f"账号 {username} [DRY_RUN] 当前可见会话标题: {titles}")
 
 
+def probe_target_profile_names(page, username, targets):
+    """DRY_RUN 只读诊断：尝试访问每个目标的主页，读取显示名。
+
+    抖音网页版可能支持 /user/{抖音号} 直达主页，主页标题/og:title 含显示名。
+    仅当 dryRun 时调用：只读页面标题，不发送、不点击、不填表。
+    主页可能 404/要求登录/渲染不出名字，读不到就记为 None（该目标按不可达处理）。
+    另开独立页面做探测，不影响 /chat 主页面。
+    """
+    try:
+        ctx = page.context
+    except Exception:
+        return
+    for target in targets:
+        tid = target["id"]
+        url = f"https://www.douyin.com/user/{tid}"
+        name = None
+        try:
+            probe_page = ctx.new_page()
+            try:
+                probe_page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                probe_page.wait_for_timeout(2500)
+                name = probe_page.evaluate(
+                    """() => {
+                        const og = document.querySelector('meta[property="og:title"]');
+                        const t = document.title || '';
+                        const raw = (og && og.content) ? og.content : t;
+                        return (raw || '').trim().slice(0, 40) || null;
+                    }"""
+                )
+            finally:
+                probe_page.close()
+        except Exception:
+            name = None
+        logger.info(f"账号 {username} [DRY_RUN] 目标 {tid!r} 主页显示名: {name}")
+
+
 def list_diagnostics(page, limit=8):
     """只读：返回会话列表候选元素的结构诊断（selector/index/是否可见/位置）。
 
@@ -476,14 +512,17 @@ def list_diagnostics(page, limit=8):
 
 _SCROLLER_WALK_JS = """(element) => {
     let node = element;
-    while (node && node !== document.body) {
+    while (node) {
         const style = getComputedStyle(node);
         if (/(auto|scroll)/.test(style.overflowY)) {
             return node;
         }
+        if (node === document.documentElement) {
+            break;
+        }
         node = node.parentElement;
     }
-    return element;
+    return null;
 }"""
 
 
@@ -541,13 +580,14 @@ def select_by_virtual_list(page, username, target, item_selector):
     2. 连续多轮「可见标题窗口不变 且 已见集合不再增长」-> 判定不可见并停止
     3. scrollTop 只作为辅助诊断日志，不单独作为停止依据
 
-    find_real_scroller 每次重新扫描候选；找不到滚动容器 -> 抛 ChatUnavailable
-    中止该账号（列表不可用，逐目标等 20s 只会浪费时间）。
+    find_real_scroller 每次重新扫描候选；找不到滚动容器 -> 只跳过该目标（返回 not_found），
+    继续下一个目标——搜索路径仍可能为其他目标生效。页面级不可用由 wait_for_chat_ready 抛
+    ChatUnavailable 负责（列表根本未渲染时才中止账号）。
     """
     scroller = find_real_scroller(page)
     if scroller is None:
-        logger.warning(f"账号 {username} 未找到可滚动容器，判定 chat_unavailable")
-        raise ChatUnavailable(f"账号 {username} 停留在聊天页但列表不可滚动/不可见")
+        logger.warning(f"账号 {username} 未找到可滚动容器，滚动兜底跳过目标 {target['id']}")
+        return None, None
     try:
         scroller.hover()  # 悬停在真实滚动区，wheel 事件才可能被虚拟列表捕获
     except Exception:
@@ -604,7 +644,7 @@ def select_target(page, username, target, item_selector, search):
 
     搜索后会话列表被 SearchPanel 覆盖为 hidden，命中项在 .SearchPanelitembox 里；
     点 .SearchPanelitemchat_btn 才会真正进入会话（真实 DOM 验证）。已删除全页 get_by_text 兜底。
-    找不到滚动容器时由 select_by_virtual_list 抛 ChatUnavailable 中止该账号。
+    滚动兜底失败只跳过该目标（返回 not_found），不影响其他目标的搜索路径。
     """
     wanted_set = set(target["title_aliases_norm"])
     wanted_tight_set = set(norm_tight(a) for a in target["title_aliases"])
@@ -872,8 +912,9 @@ def do_user_task(browser, username, cookies, targets):
         search = find_search_box(page, username)
         logger.debug(f"账号 {username} 搜索框可用: {search is not None}")
         if config.get("dryRun"):
-            # 只读诊断：记录可见会话标题，用于把 unique_id 目标映射到真实显示名
+            # 只读诊断：记录可见会话标题 + 探测各目标主页显示名，用于把 unique_id 目标映射到真实显示名
             log_visible_conversation_titles(page, username, item_selector)
+            probe_target_profile_names(page, username, targets)
 
         not_found = []
         unverified = []
