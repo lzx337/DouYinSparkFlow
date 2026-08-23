@@ -2,6 +2,7 @@ import os, sys
 from enum import Enum
 import json
 import logging
+from utils import norm
 from utils.logger import setup_logger
 
 logger = setup_logger(level=logging.DEBUG)
@@ -54,15 +55,117 @@ def get_config():
         "friendListTimeout": int(os.getenv("FRIEND_LIST_WAIT_TIME", "2000")),  # 好友列表加载超时时间，单位毫秒
         "taskRetryTimes": int(os.getenv("TASK_RETRY_TIMES", "3")),  # 任务重试次数
         "logLevel": os.getenv("LOG_LEVEL", "DEBUG"),  # 日志级别
+        # 发送确认用的气泡选择器：需要在真实登录页人工核对后填入，缺省不启用气泡确认
+        "outgoingBubbleSelector": os.getenv("OUTGOING_BUBBLE_SELECTOR", ""),
+        "failedBubbleSelector": os.getenv("FAILED_BUBBLE_SELECTOR", ""),
     }
 
     return config
 
+
+# Playwright add_cookies 只接受这些字段；值为布尔/枚举的字段单独校验
+_PLAYWRIGHT_COOKIE_FIELDS = (
+    "name", "value", "domain", "path", "url", "expires",
+    "httpOnly", "secure", "sameSite",
+)
+_VALID_SAME_SITE = ("Strict", "Lax", "None")
+
+
 def sanitize_cookies(cookies):
+    """清洗 cookie 列表，使其符合 Playwright context.add_cookies 的字段要求。
+
+    - 保留合法字段（含 sameSite；Playwright 支持 Strict / Lax / None）
+    - expirationDate（部分导出工具使用 CDP 命名）统一为 expires
+    - 剔除 Playwright 不接受的字段（hostOnly / storeId / session 等）
+    - sameSite 值非法时丢弃该字段；expires 只接受数字
+
+    注意：不在此处改变任何 Cookie 的值，也不把 Cookie 写入任何文件。
+    """
+    cleaned = []
     for cookie in cookies:
-        if "sameSite" in cookie:
-            cookie.pop("sameSite")  # 移除 sameSite 字段，Playwright 可能不支持该字段
-    return cookies
+        if not isinstance(cookie, dict):
+            continue
+        c = {}
+
+        expires = cookie.get("expires", cookie.get("expirationDate"))
+        if isinstance(expires, (int, float)) and not isinstance(expires, bool):
+            c["expires"] = int(expires) if float(expires).is_integer() else float(expires)
+
+        for field in ("name", "value", "domain", "path", "url"):
+            if cookie.get(field) is not None:
+                c[field] = cookie[field]
+        for flag in ("httpOnly", "secure"):
+            if isinstance(cookie.get(flag), bool):
+                c[flag] = cookie[flag]
+
+        same_site = cookie.get("sameSite")
+        if same_site in _VALID_SAME_SITE:
+            c["sameSite"] = same_site
+
+        if "name" in c and "value" in c:
+            cleaned.append(c)
+    return cleaned
+
+
+def parse_targets(raw_targets):
+    """把 TASKS 里的 targets 解析为规范结构，兼容新旧两种格式。
+
+    旧格式（兼容）：["好友名1", "好友名2"]
+    新格式：       [{"id": "好友名", "search_terms": ["搜索词", ...],
+                     "title_aliases": ["标题别名", ...]}]
+      - search_terms：填入搜索框用的词（可多个，逐个尝试）
+      - title_aliases：用于会话列表/表头的严格标题匹配（必须逐一与真实标题一致）
+      - id：仅用于日志与去重
+
+    返回列表，每项包含 id / search_terms / search_terms_norm /
+    title_aliases / title_aliases_norm。解析失败（缺字段/空列表）的项会被跳过并告警。
+    """
+    if not isinstance(raw_targets, list):
+        logger.warning(f"targets 不是列表，已忽略: {raw_targets!r}")
+        return []
+
+    parsed = []
+    for item in raw_targets:
+        if isinstance(item, str):
+            n = norm(item)
+            if not n:
+                logger.warning(f"target 为空字符串，已跳过")
+                continue
+            parsed.append(
+                {
+                    "id": n,
+                    "search_terms": [item],
+                    "search_terms_norm": [n],
+                    "title_aliases": [item],
+                    "title_aliases_norm": [n],
+                }
+            )
+        elif isinstance(item, dict):
+            search_terms = item.get("search_terms")
+            title_aliases = item.get("title_aliases")
+            if not isinstance(search_terms, list) or not search_terms:
+                logger.warning(f"target 缺少有效 search_terms，已跳过: {item!r}")
+                continue
+            if not isinstance(title_aliases, list) or not title_aliases:
+                logger.warning(f"target 缺少有效 title_aliases，已跳过: {item!r}")
+                continue
+            st = [x for x in search_terms if isinstance(x, str) and norm(x)]
+            ta = [x for x in title_aliases if isinstance(x, str) and norm(x)]
+            if not st or not ta:
+                logger.warning(f"target 的 search_terms/title_aliases 无有效字符串，已跳过: {item!r}")
+                continue
+            parsed.append(
+                {
+                    "id": norm(str(item.get("id") or st[0])),
+                    "search_terms": st,
+                    "search_terms_norm": [norm(x) for x in st],
+                    "title_aliases": ta,
+                    "title_aliases_norm": [norm(x) for x in ta],
+                }
+            )
+        else:
+            logger.warning(f"target 格式不支持，已跳过: {item!r}")
+    return parsed
 
 
 def get_userData():
@@ -75,7 +178,11 @@ def get_userData():
     if userData:
         return userData
 
-    tasks = json.loads(os.getenv("TASKS", "[]"))
+    try:
+        tasks = json.loads(os.getenv("TASKS", "[]"))
+    except json.JSONDecodeError:
+        logger.warning("TASKS 环境变量不是合法 JSON，已按空处理")
+        tasks = []
 
     userData = []
 
@@ -83,15 +190,13 @@ def get_userData():
         username = task.get("username", "未知用户")
         unique_id = task.get("unique_id")
         if not unique_id:
-            logger.warning(f"{username} 的任务  缺少 unique_id 字段，已跳过")
+            logger.warning(f"{username} 的任务缺少 unique_id 字段，已跳过")
             continue
         cookies_key = f"cookies_{unique_id}".upper()
-        cookies_str = (
-            os.getenv(cookies_key, "").encode("utf-8").decode("unicode_escape")
-        )
+        cookies_str = os.getenv(cookies_key, "")
         if not cookies_str:
             logger.warning(
-                f"{username} 的任务 缺少 {cookies_key} 环境变量，已跳过"
+                f"{username} 的任务缺少 {cookies_key} 环境变量，已跳过"
             )
             continue
         try:
@@ -100,12 +205,14 @@ def get_userData():
             logger.warning(f"{username} 的任务 {cookies_key} 格式不正确，已跳过")
             continue
 
+        targets = parse_targets(task.get("targets", []))
+
         userData.append(
             {
                 "unique_id": unique_id,
                 "username": username,
                 "cookies": sanitize_cookies(cookies),
-                "targets": task.get("targets", []),
+                "targets": targets,
             }
         )
 
