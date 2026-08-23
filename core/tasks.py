@@ -6,7 +6,7 @@ from playwright.sync_api import Response, TimeoutError as PlaywrightTimeoutError
 
 from core.browser import get_browser
 from core.msg_builder import build_message
-from utils import norm, strict_title_match
+from utils import norm, norm_tight, strict_title_match
 from utils.config import get_config, get_userData
 from utils.logger import setup_logger
 
@@ -46,10 +46,27 @@ SEARCH_BOX_SELECTORS = [
     "input[aria-label*='搜索']",
     "input[type='search']",
 ]
+# 表头标题：真实登录页验证为 .RightPanelHeadertitle。
+# 注意：旧推断 .messageChatItemTitle 在真实 DOM 不存在；[class*='Message'][class*='Title']
+# 匹配到的是消息气泡里的发送者昵称（假阳性），已移除，避免「表头校验」被气泡昵称蒙混。
 CHAT_HEADER_TITLE_SELECTORS = [
-    ".messageChatItemTitle",
+    ".RightPanelHeadertitle",
+    "[class*='RightPanelHeader'][class*='title']",
     "[class*='message'][class*='Title']",
-    "[class*='Message'][class*='Title']",
+]
+# 搜索结果容器：搜索后 .conversationConversationItemwrapper 会被 SearchPanel 覆盖成 hidden，
+# 结果渲染在 SearchPanelitem 系列（真实 DOM 验证）。点击 chat_btn 才会真正进入会话。
+SEARCH_PANEL_ITEM_SELECTORS = [
+    ".SearchPanelitembox",
+    "[class*='SearchPanel'][class*='item']",
+]
+SEARCH_PANEL_TITLE_SELECTORS = [
+    ".SearchPanelitemtitle",
+    "[class*='SearchPanel'][class*='title']",
+]
+SEARCH_PANEL_CHAT_BTN_SELECTORS = [
+    ".SearchPanelitemchat_btn",
+    "[class*='SearchPanel'][class*='chat']",
 ]
 
 # 安全验证 / 登录关键词：一旦命中即视为需要人工介入，安全停止该账号
@@ -282,6 +299,34 @@ def exact_visible_item(page, item_selector, wanted_set):
     return None, None
 
 
+def exact_search_panel_item(page, wanted_tight_set):
+    """遍历 SearchPanel 搜索结果项，标题 norm_tight 后与目标任一别名逐字符相等。
+
+    搜索后会话列表被 SearchPanel 覆盖为 hidden，命中项在 .SearchPanelitembox 里。
+    wanted_tight_set：{norm_tight(别名), ...}。
+    返回 (item_box, title)；只有逐字符相等才算命中。
+    """
+    for selector in SEARCH_PANEL_ITEM_SELECTORS:
+        try:
+            boxes = page.locator(selector)
+            for i in range(boxes.count()):
+                el = boxes.nth(i)
+                try:
+                    title_el = el.locator(SEARCH_PANEL_TITLE_SELECTORS[0]).first
+                    if title_el.count() == 0:
+                        continue
+                    if not title_el.is_visible():
+                        continue
+                    title = title_el.inner_text(timeout=1500).strip()
+                except Exception:
+                    continue
+                if title and norm_tight(title) in wanted_tight_set:
+                    return el, title
+        except Exception:
+            continue
+    return None, None
+
+
 def visible_titles(page, item_selector):
     """返回当前可见会话项的 norm 后标题元组（仅用于停止条件判断）。"""
     out = []
@@ -388,9 +433,11 @@ def select_by_virtual_list(page, username, target, list_selector, item_selector)
 def select_target(page, username, target, list_selector, item_selector, search):
     """主路径：搜索框精确筛选；兜底：滚动。找到并点击后返回 (True, title)，否则 (False, None)。
 
-    已删除全页 get_by_text 兜底：在结果容器无法确认时宁可不点，避免误发。
+    搜索后会话列表被 SearchPanel 覆盖为 hidden，命中项在 .SearchPanelitembox 里；
+    点 .SearchPanelitemchat_btn 才会真正进入会话（真实 DOM 验证）。已删除全页 get_by_text 兜底。
     """
     wanted_set = set(target["title_aliases_norm"])
+    wanted_tight_set = set(norm_tight(a) for a in target["title_aliases"])
     if search is not None:
         for term in target["search_terms"]:
             try:
@@ -399,7 +446,21 @@ def select_target(page, username, target, list_selector, item_selector, search):
             except Exception as e:
                 logger.debug(f"账号 {username} 搜索输入 {term!r} 失败: {e}")
                 continue
-            # 只允许在会话列表内精确匹配；不点页面任意同名文本
+            # 搜索结果进 SearchPanel：在 .SearchPanelitembox 内精确匹配标题
+            el, title = exact_search_panel_item(page, wanted_tight_set)
+            if el is not None:
+                try:
+                    # 点击「去聊天」按钮才进入会话；找不到按钮则点结果项本身
+                    btn = el.locator(SEARCH_PANEL_CHAT_BTN_SELECTORS[0]).first
+                    if btn.count() > 0 and btn.is_visible():
+                        btn.click()
+                    else:
+                        el.click()
+                    return True, title
+                except Exception as e:
+                    logger.warning(f"账号 {username} 点击好友 {target['id']} 失败: {e}")
+                    return False, None
+            # 兜底：若 SearchPanel 没出现（搜索无结果），尝试会话列表内精确匹配
             el, title = exact_visible_item(page, item_selector, wanted_set)
             if el is not None:
                 try:
@@ -425,10 +486,11 @@ def select_target(page, username, target, list_selector, item_selector, search):
     return False, None
 
 
-def read_chat_header_title(page):
+def read_chat_header_title(page, wait_seconds=5):
     """尽力读取当前打开会话的标题栏文本，用于发送前二次确认。
 
-    优先使用配置的 CHAT_HEADER_TITLE_SELECTOR（真实页面核实后填入），
+    点击会话后标题栏需要短暂渲染，这里对每个候选 wait_for(visible)（单个 selector
+    最多 wait_seconds 秒），再读文本。优先使用配置的 CHAT_HEADER_TITLE_SELECTOR，
     否则回退到推断列表。读不到返回 ""，调用方必须据此跳过发送。
     """
     selectors = []
@@ -439,8 +501,8 @@ def read_chat_header_title(page):
     for selector in selectors:
         try:
             loc = page.locator(selector).first
-            if loc.count() > 0 and loc.is_visible():
-                return loc.inner_text(timeout=2000).strip()
+            loc.wait_for(state="visible", timeout=wait_seconds * 1000)
+            return loc.inner_text(timeout=2000).strip()
         except Exception:
             continue
     return ""
