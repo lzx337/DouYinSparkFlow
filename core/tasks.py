@@ -161,7 +161,8 @@ def checkTargetName(targetName, targets):
         matched = next((v for v in userIDDict[targetName] if v and v in targets), None)
         if matched is not None:
             target_symbol = matched
-    elif targetName in targets:
+    # 兜底：即使 userIDDict 里有该好友但没匹配上，也允许直接用聊天列表标题匹配目标
+    if target_symbol is None and targetName in targets:
         target_symbol = targetName
     return target_symbol
 
