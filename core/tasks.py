@@ -6,7 +6,7 @@ from playwright.sync_api import Response, TimeoutError as PlaywrightTimeoutError
 
 from core.browser import get_browser
 from core.msg_builder import build_message
-from utils import norm
+from utils import norm, strict_title_match, title_matches_aliases
 from utils.config import get_config, get_userData
 from utils.logger import setup_logger
 
@@ -14,7 +14,6 @@ from utils.logger import setup_logger
 config = get_config()
 userData = get_userData()
 logger = setup_logger(level=config.get("logLevel", "Info"))
-userIDDict = {}
 
 CONVERSATION_ITEM_SELECTORS = [
     ".conversationConversationItemwrapper",
@@ -26,23 +25,26 @@ CONVERSATION_TITLE_SELECTORS = [
     "[class*='conversation'][class*='title']",
     "[class*='Conversation'][class*='title']",
 ]
+# 不再接受宽泛的 [role='list']：登录页 / 其他面板也可能带 role=list，会被误判为聊天列表
 CONVERSATION_LIST_SELECTORS = [
     ".conversationConversationListwrapper",
     "[class*='conversation'][class*='List']",
     "[class*='Conversation'][class*='List']",
-    "[role='list']",
 ]
+# 编辑器限定在聊天编辑面板内；裸 [contenteditable='true'] 只作最后兜底，避免抓到页面其他可编辑区域
 CHAT_EDITOR_SELECTORS = [
     ".messageEditorimChatEditorContainer",
+    "[class*='messageEditor'][contenteditable='true']",
+    "[class*='Message'][contenteditable='true']",
     "[contenteditable='true']",
     "textarea",
 ]
+# 只接受带搜索语义的输入框；不再用「会话容器内任意 input[type='text']」兜底
 SEARCH_BOX_SELECTORS = [
     "input[placeholder*='搜索']",
     "input[placeholder*='搜']",
+    "input[aria-label*='搜索']",
     "input[type='search']",
-    "[class*='conversation'] input[type='text']",
-    "[class*='Conversation'] input[type='text']",
 ]
 CHAT_HEADER_TITLE_SELECTORS = [
     ".messageChatItemTitle",
@@ -50,40 +52,48 @@ CHAT_HEADER_TITLE_SELECTORS = [
     "[class*='Message'][class*='Title']",
 ]
 
+# 安全验证 / 登录关键词：一旦命中即视为需要人工介入，安全停止该账号
+SECURITY_KEYWORDS = ("安全验证", "验证码", "短信验证", "登录")
+
 
 class LoginRequired(RuntimeError):
     """登录态失效或需要人工安全验证。"""
 
 
-def handle_response(response: Response):
-    """缓存抖音 IM 用户信息接口返回值；仅作为加速索引，不依赖它匹配好友。
+def make_handle_response(userIDDict):
+    """返回绑定到指定账号 userIDDict 的响应处理器。
 
-    账号可能被服务端风控降级（data: null），此时接口完全不可用，直接忽略，
-    匹配走聊天 UI 的搜索/列表标题。
+    缓存抖音 IM 用户信息接口返回值；仅作为加速索引，不依赖它匹配好友。
+    账号被服务端风控降级（data: null）时接口完全不可用，直接忽略，
+    匹配走聊天 UI 的搜索 / 列表标题。
+    userIDDict 在账号维度创建，绝不跨账号复用。
     """
-    if "aweme/v1/web/im/user/info" not in response.url:
-        return
-    try:
-        json_data = response.json()
-    except Exception:
-        return
-    data = json_data.get("data")
-    if not isinstance(data, list):
-        logger.warning(f"user/info 返回不可用（风控降级）: {json_data.get('data')!r}")
-        return
-    for item in data:
-        short_id = item.get("short_id")
-        unique_id = item.get("unique_id")
-        sec_uid = item.get("sec_uid", "")
-        nickname = norm(item.get("nickname"))
-        remark_name = norm(item.get("remark_name", nickname))
-        userIDDict[remark_name] = [
-            short_id,
-            unique_id,
-            sec_uid,
-            nickname,
-            remark_name,
-        ]
+
+    def handle_response(response: Response):
+        if "aweme/v1/web/im/user/info" not in response.url:
+            return
+        try:
+            json_data = response.json()
+        except Exception:
+            return
+        data = json_data.get("data")
+        if not isinstance(data, list):
+            return
+        for item in data:
+            short_id = item.get("short_id")
+            unique_id = item.get("unique_id")
+            sec_uid = item.get("sec_uid", "")
+            nickname = norm(item.get("nickname"))
+            remark_name = norm(item.get("remark_name", nickname))
+            userIDDict[remark_name] = [
+                short_id,
+                unique_id,
+                sec_uid,
+                nickname,
+                remark_name,
+            ]
+
+    return handle_response
 
 
 def retry_operation(name, operation, retries=3, delay=2, *args, **kwargs):
@@ -110,6 +120,13 @@ def first_visible_locator(page, selectors, timeout=5000):
     return None, None
 
 
+def _body_text(page, limit=2000):
+    try:
+        return page.locator("body").inner_text(timeout=3000)[:limit]
+    except Exception:
+        return ""
+
+
 def dump_debug_artifacts(page, username, reason):
     """只保存脱敏文本日志和截图，不保存完整 HTML（避免泄露会话令牌/Cookie）。"""
     safe_reason = "".join(c if c.isalnum() or c in "-_" else "_" for c in reason)[:40]
@@ -127,11 +144,7 @@ def dump_debug_artifacts(page, username, reason):
     try:
         title = page.title()
         url = page.url
-        body_text = ""
-        try:
-            body_text = page.locator("body").inner_text(timeout=3000)[:2000]
-        except Exception:
-            pass
+        body_text = _body_text(page)
         with open(f"{base_path}.txt", "w", encoding="utf-8") as f:
             f.write(f"url: {url}\ntitle: {title}\n\n{body_text}")
     except Exception as e:
@@ -153,22 +166,37 @@ def wait_for_chat_ready(page, username):
     except PlaywrightTimeoutError:
         logger.debug(f"账号 {username} networkidle 超时，可能是抖音长连接导致，继续检查页面")
 
+    # 最终必须停留在 /chat；若被重定向到登录 / 验证页，安全停止该账号
+    if "/chat" not in page.url:
+        body_text = _body_text(page)
+        if any(k in body_text for k in SECURITY_KEYWORDS):
+            dump_debug_artifacts(page, username, "login-or-verify")
+            raise LoginRequired(
+                f"账号 {username} 未进入聊天页（URL={page.url!r}），疑似需要人工安全验证/登录。"
+            )
+        try:
+            page.wait_for_url("**/chat**", timeout=10000)
+        except PlaywrightTimeoutError:
+            pass
+        if "/chat" not in page.url:
+            dump_debug_artifacts(page, username, "not-chat-url")
+            raise LoginRequired(f"账号 {username} 未停留在聊天页（URL={page.url!r}）。")
+
     list_selector, _ = first_visible_locator(page, CONVERSATION_LIST_SELECTORS, timeout=15000)
     if list_selector:
         logger.debug(f"账号 {username} 聊天列表已加载，选择器: {list_selector}")
         return list_selector
 
     title = ""
-    body_text = ""
     try:
         title = page.title()
-        body_text = page.locator("body").inner_text(timeout=3000)[:500]
     except Exception:
         pass
+    body_text = _body_text(page, 500)
 
     dump_debug_artifacts(page, username, "chat-list-not-found")
 
-    if "login" in page.url.lower() or "登录" in body_text or "验证码" in body_text or "短信验证" in body_text:
+    if any(k in body_text for k in SECURITY_KEYWORDS):
         raise LoginRequired(
             f"账号 {username} 未进入聊天列表，疑似 Cookie 失效或需要人工安全验证。"
         )
@@ -203,32 +231,71 @@ def resolve_item_selector(page):
     return CONVERSATION_ITEM_SELECTORS[0]
 
 
-def find_search_box(page):
-    """聊天列表顶部的搜索框；找到返回 locator，找不到返回 None。"""
+def find_search_box(page, username):
+    """只接受带搜索语义的输入框；候选不等于 1 时记录脱敏诊断并失败（不使用搜索，仅滚动）。
+
+    绝不猜测：输入框个数含糊时不选中任何一个，避免把消息发到错误会话。
+    """
     for selector in SEARCH_BOX_SELECTORS:
         try:
-            loc = page.locator(selector).first
-            if loc.count() > 0 and loc.is_visible():
-                return loc
+            loc = page.locator(selector)
+            if loc.count() == 1 and loc.first.is_visible():
+                return loc.first
         except Exception:
             continue
+
+    # 脱敏诊断：只记录 type/placeholder/aria-label，不记录页面内容/Cookie
+    inputs = []
+    try:
+        for i in range(min(page.locator("input").count(), 10)):
+            el = page.locator("input").nth(i)
+            inputs.append(
+                {
+                    "type": el.get_attribute("type"),
+                    "placeholder": el.get_attribute("placeholder"),
+                    "aria": el.get_attribute("aria-label"),
+                }
+            )
+    except Exception:
+        inputs = []
+    logger.warning(
+        f"账号 {username} 未找到唯一搜索框（诊断: {inputs}），本次不使用搜索，仅靠滚动匹配"
+    )
     return None
 
 
-def exact_visible_item(page, item_selector, target):
-    """遍历当前可见会话项，标题精确匹配目标（归一化后逐字符相等）。"""
-    wanted = norm(target)
+def exact_visible_item(page, item_selector, wanted_set):
+    """遍历当前可见会话项，标题 norm 后与目标任一别名逐字符相等。
+
+    wanted_set：{norm(别名), ...}。只有逐字符相等才算命中，不做包含匹配。
+    """
     for i in range(page.locator(item_selector).count()):
         try:
             el = page.locator(item_selector).nth(i)
             if not el.is_visible():
                 continue
             title = get_item_title(el)
-            if title and norm(title) == wanted:
+            if title and norm(title) in wanted_set:
                 return el, title
         except Exception:
             continue
     return None, None
+
+
+def visible_titles(page, item_selector):
+    """返回当前可见会话项的 norm 后标题元组（仅用于停止条件判断）。"""
+    out = []
+    for i in range(page.locator(item_selector).count()):
+        try:
+            el = page.locator(item_selector).nth(i)
+            if not el.is_visible():
+                continue
+            t = get_item_title(el)
+            if t:
+                out.append(norm(t))
+        except Exception:
+            continue
+    return tuple(out)
 
 
 def find_real_scroller(page, list_selector):
@@ -256,20 +323,33 @@ def find_real_scroller(page, list_selector):
 
 
 def select_by_virtual_list(page, username, target, list_selector, item_selector):
-    """滚动兜底：真实滚动容器 + 鼠标滚轮（更接近真实用户触发虚拟列表加载）。"""
+    """滚动兜底：真实滚动容器 + 鼠标滚轮（贴近真实用户触发虚拟列表加载）。
+
+    停止条件（组合判定，缺一不可）：
+    1. 目标任一别名在可见窗口中精确匹配 -> 点击返回（最高优先）
+    2. 连续多轮「可见标题窗口不变 且 已见集合不再增长」-> 判定不可见并停止
+    3. scrollTop 只作为辅助诊断日志，不单独作为停止依据
+    """
     scroller = find_real_scroller(page, list_selector)
     if scroller is None:
         logger.warning(f"账号 {username} 未找到可滚动容器")
         return None, None
     try:
-        scroller.hover()
+        scroller.hover()  # 悬停在真实滚动区，wheel 事件才可能被虚拟列表捕获
     except Exception:
         pass
 
-    stale_rounds = 0
-    last_state = None
-    for _ in range(80):
-        el, title = exact_visible_item(page, item_selector, target)
+    wanted_set = set(target["title_aliases_norm"])
+    seen = set()
+    last_window = tuple()
+    stagnant = 0
+    for _ in range(120):
+        window = visible_titles(page, item_selector)
+        seen_before = len(seen)
+        seen.update(window)
+        grew = len(seen) > seen_before
+
+        el, title = exact_visible_item(page, item_selector, wanted_set)
         if el is not None:
             return el, title
 
@@ -285,54 +365,54 @@ def select_by_virtual_list(page, username, target, list_selector, item_selector)
             )
         except Exception:
             state = None
+        logger.debug(
+            f"账号 {username} 滚动中 scrollTop={state and state.get('top')} "
+            f"可见窗口={len(window)} 累计标题={len(seen)}"
+        )
 
-        if state is not None:
-            if state == last_state:
-                stale_rounds += 1
-            else:
-                stale_rounds = 0
-                last_state = state
-            at_bottom = state["top"] >= state["height"] - state["client"] - 2
-            if at_bottom or stale_rounds >= 5:
-                break
+        if window == last_window and not grew:
+            stagnant += 1
+        else:
+            stagnant = 0
+        last_window = window
+        if stagnant >= 6:
+            logger.debug(
+                f"账号 {username} 连续 {stagnant} 轮可见窗口无变化且无新标题，判定 {target['id']} 不可见"
+            )
+            break
 
-    logger.warning(f"账号 {username} 滚动到底仍未找到目标 {target!r}")
+    logger.warning(f"账号 {username} 滚动结束仍未找到目标 {target['id']}")
     return None, None
 
 
 def select_target(page, username, target, list_selector, item_selector, search):
-    """主路径：搜索框精确筛选；兜底：滚动。找到并点击后返回 (True, title)，否则 (False, None)。"""
+    """主路径：搜索框精确筛选；兜底：滚动。找到并点击后返回 (True, title)，否则 (False, None)。
+
+    已删除全页 get_by_text 兜底：在结果容器无法确认时宁可不点，避免误发。
+    """
+    wanted_set = set(target["title_aliases_norm"])
     if search is not None:
-        try:
-            search.fill(target)
-            time.sleep(0.8)
-        except Exception as e:
-            logger.debug(f"账号 {username} 搜索输入失败: {e}")
-
-        # 优先：搜索可能就地过滤会话列表
-        el, title = exact_visible_item(page, item_selector, target)
-        if el is not None:
+        for term in target["search_terms"]:
             try:
-                el.click()
-                return True, title
+                search.fill(term)
+                time.sleep(0.8)
             except Exception as e:
-                logger.warning(f"账号 {username} 点击好友 {target} 失败: {e}")
-                return False, None
-
-        # 其次：页面上精确文本的可见元素（搜索结果面板等）
-        try:
-            loc = page.get_by_text(target, exact=True).filter(visible=True).first
-            if loc.count() > 0:
-                loc.click()
-                return True, target
-        except Exception as e:
-            logger.debug(f"账号 {username} 搜索结果点选失败: {e}")
-
-        # 清空搜索，回到完整列表
-        try:
-            search.fill("")
-        except Exception:
-            pass
+                logger.debug(f"账号 {username} 搜索输入 {term!r} 失败: {e}")
+                continue
+            # 只允许在会话列表内精确匹配；不点页面任意同名文本
+            el, title = exact_visible_item(page, item_selector, wanted_set)
+            if el is not None:
+                try:
+                    el.click()
+                    return True, title
+                except Exception as e:
+                    logger.warning(f"账号 {username} 点击好友 {target['id']} 失败: {e}")
+                    return False, None
+            try:
+                search.fill("")
+            except Exception:
+                pass
+            time.sleep(0.3)
 
     el, title = select_by_virtual_list(page, username, target, list_selector, item_selector)
     if el is not None:
@@ -340,7 +420,7 @@ def select_target(page, username, target, list_selector, item_selector, search):
             el.click()
             return True, title
         except Exception as e:
-            logger.warning(f"账号 {username} 点击好友 {target} 失败: {e}")
+            logger.warning(f"账号 {username} 点击好友 {target['id']} 失败: {e}")
             return False, None
     return False, None
 
@@ -357,21 +437,35 @@ def read_chat_header_title(page):
     return ""
 
 
-def send_chat_message(page, username, target):
-    # 若页面已跳转到安全验证/登录页，立即失败退出该账号，不做循环重试
-    try:
-        body_text = page.locator("body").inner_text(timeout=2000)[:200]
-    except Exception:
-        body_text = ""
+def send_chat_message(page, username, target, config):
+    """发送前二次确认 -> 输入 -> 发送 -> 本人气泡计数 +1 确认。
+
+    返回 (状态, 详情)：
+      ("sent", None)            已确认发送成功
+      ("unverified", reason)    已尝试发送但无法可靠确认，绝不自动重发
+      ("failed", reason)        明确失败（气泡数未增加 / 失败标记 / 文字不一致）
+    若检测到安全验证，抛 LoginRequired 安全停止该账号。
+    """
+    body_text = _body_text(page, 2000)
     if any(k in body_text for k in ("安全验证", "验证码", "短信验证")):
         raise LoginRequired(f"账号 {username} 出现安全验证/登录提示，请人工处理")
 
-    # 点开会话后输入框应在几秒内出现；等待时间别太长，避免单个目标白等
     _, chat_input = first_visible_locator(page, CHAT_EDITOR_SELECTORS, timeout=10000)
     if chat_input is None:
         dump_debug_artifacts(page, username, "chat-editor-not-found")
         logger.warning(f"账号 {username} 未找到聊天输入框")
-        return False
+        return "failed", "未找到聊天输入框"
+
+    outgoing_sel = config.get("outgoingBubbleSelector") or ""
+    failed_sel = config.get("failedBubbleSelector") or ""
+
+    before = -1
+    if outgoing_sel:
+        try:
+            before = page.locator(outgoing_sel).count()
+        except Exception:
+            before = -1
+            logger.warning(f"账号 {username} 无法读取本人气泡数量（选择器 {outgoing_sel!r}）")
 
     message = build_message()
     lines = message.replace("\\\\n", chr(10)).splitlines() or [message]
@@ -379,21 +473,88 @@ def send_chat_message(page, username, target):
         chat_input.type(line)
         if index != len(lines) - 1:
             chat_input.press("Shift+Enter")
-    logger.debug(f"账号 {username} 准备发送消息给好友 {target}：\n\t{message}")
+    logger.debug(f"账号 {username} 发送消息：\n\t{message}")
     chat_input.press("Enter")
-    logger.debug(f"账号 {username} 给好友 {target} 发送消息完成")
-    time.sleep(2)
-    return True
+    logger.debug(f"账号 {username} 已按下发送")
+
+    # 无法可靠定位本人气泡 -> unverified，不当成功，也不自动重发
+    if not outgoing_sel:
+        return "unverified", "未配置 outgoingBubbleSelector"
+    if before < 0:
+        return "unverified", "无法定位本人气泡"
+
+    count = before
+    last_text = ""
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        time.sleep(1)
+        try:
+            count = page.locator(outgoing_sel).count()
+            if count > before:
+                try:
+                    last_text = norm(
+                        page.locator(outgoing_sel).nth(before).inner_text(timeout=2000)
+                    )
+                except Exception:
+                    last_text = ""
+                break
+        except Exception:
+            continue
+    if count <= before:
+        logger.warning(f"账号 {username} 发送后本人气泡数未增加，判定发送失败")
+        return "failed", "气泡数未增加"
+
+    if failed_sel:
+        try:
+            bubble = page.locator(outgoing_sel).nth(before)
+            if bubble.locator(failed_sel).count() > 0:
+                logger.warning(f"账号 {username} 检测到发送失败标记")
+                return "failed", "失败标记"
+        except Exception:
+            pass
+
+    # 尽力验证最后一条气泡文字与消息一致
+    if last_text:
+        norm_msg = norm(message)
+        if norm_msg and norm_msg not in last_text:
+            logger.warning(
+                f"账号 {username} 气泡文字与消息不一致: {last_text!r} vs {norm_msg!r}"
+            )
+            return "failed", "气泡文字与消息不一致"
+
+    logger.info(f"账号 {username} 消息发送成功并确认（本人气泡数 {before} -> {count}）")
+    return "sent", None
 
 
 def do_user_task(browser, username, cookies, targets):
-    context = browser.new_context()
+    # browser 可能是常规 browser（可 new_context()），也可能是本地已登录的 persistent_context
+    owns_context = hasattr(browser, "new_context")
+    if owns_context:
+        context = browser.new_context()
+    else:
+        context = browser
     try:
         context.set_default_navigation_timeout(config["browserTimeout"])
         context.set_default_timeout(config["browserTimeout"])
-        page = context.new_page()
-        page.on("response", handle_response)
-        context.add_cookies(cookies)
+
+        if owns_context:
+            page = context.new_page()
+        else:
+            # 本地 profile 模式：复用 profile 里已打开的页面，登录态在 profile 中
+            page = context.pages[0] if context.pages else context.new_page()
+
+        # userIDDict 账号级隔离：绝不跨账号复用
+        userIDDict = {}
+        page.on("response", make_handle_response(userIDDict))
+        if owns_context:
+            context.add_cookies(cookies)
+        elif cookies:
+            try:
+                context.add_cookies(cookies)
+            except Exception as e:
+                logger.debug(
+                    f"账号 {username} 向 profile 注入 cookies 失败（忽略，走 profile 登录态）: {e}"
+                )
 
         retry_operation(
             "打开抖音网页聊天页面",
@@ -407,55 +568,73 @@ def do_user_task(browser, username, cookies, targets):
 
         list_selector = wait_for_chat_ready(page, username)
         item_selector = resolve_item_selector(page)
-        search = find_search_box(page)
+        search = find_search_box(page, username)
         logger.debug(f"账号 {username} 搜索框可用: {search is not None}")
 
         not_found = []
+        unverified = []
+        attempted = set()  # 当次运行内 at-most-once：同一 账号+目标 只尝试一次，绝不自动重发
         for target in targets:
-            target = norm(target)
+            target_id = target["id"]
+            key = f"{username}|{target_id}"
+            if key in attempted:
+                logger.debug(f"账号 {username} 已尝试过 {target_id}，at-most-once 跳过")
+                continue
+            attempted.add(key)
+
             try:
-                found, title = select_target(page, username, target, list_selector, item_selector, search)
+                found, title = select_target(
+                    page, username, target, list_selector, item_selector, search
+                )
             except LoginRequired:
                 raise
             except Exception as e:
-                logger.warning(f"账号 {username} 选择好友 {target} 出错: {e}")
+                logger.warning(f"账号 {username} 选择好友 {target_id} 出错: {e}")
                 found, title = False, None
 
             if not found:
-                not_found.append(target)
-                logger.warning(f"账号 {username} 未找到好友 {target}")
+                not_found.append(target_id)
+                logger.warning(f"账号 {username} 未找到好友 {target_id}")
                 continue
 
-            # 点开后等聊天面板渲染，再做发送前二次确认
             time.sleep(1)
-
-            # 发送前二次确认：打开的会话标题与目标完全一致（尽力而为）
+            # 发送前二次确认：打开的会话表头必须与目标别名严格等值
             header = read_chat_header_title(page)
             if header:
-                nh = norm(header)
-                nt = norm(target)
-                if nh != nt and nt not in nh:
+                if not strict_title_match(header, target["title_aliases"]):
                     logger.warning(
-                        f"账号 {username} 打开会话标题不匹配，跳过 {target!r} (表头 {header!r})"
+                        f"账号 {username} 表头标题与目标别名不严格匹配，跳过 {target_id!r} (表头 {header!r})"
                     )
-                    not_found.append(target)
+                    not_found.append(target_id)
                     continue
 
             try:
-                if not send_chat_message(page, username, target):
-                    not_found.append(target)
+                result, detail = send_chat_message(page, username, target, config)
+                if result == "sent":
+                    logger.info(f"账号 {username} 已向 {target_id} 发送并确认")
+                elif result == "unverified":
+                    unverified.append(target_id)
+                    logger.warning(
+                        f"账号 {username} 向 {target_id} 发送但无法确认 (unverified): {detail}"
+                    )
+                else:
+                    not_found.append(target_id)
+                    logger.warning(f"账号 {username} 向 {target_id} 发送失败: {detail}")
             except LoginRequired:
                 logger.warning(f"账号 {username} 检测到安全验证，中止该账号")
                 break
             except Exception as e:
-                logger.warning(f"账号 {username} 给 {target} 发消息失败: {e}")
-                not_found.append(target)
+                logger.warning(f"账号 {username} 给 {target_id} 发消息失败: {e}")
+                not_found.append(target_id)
 
         if not_found:
             logger.warning(f"账号 {username} 本次未找到/未发送好友: {not_found}")
+        if unverified:
+            logger.warning(f"账号 {username} 发送但未确认的好友: {unverified}")
         logger.debug(f"账号 {username} 任务完成")
     finally:
-        context.close()
+        if owns_context:
+            context.close()
 
 
 def runTasks():
@@ -467,7 +646,8 @@ def runTasks():
         logger.debug(f"一言类型: {config['hitokotoTypes']}")
         for user in userData:
             logger.debug(
-                f"用户: {user.get('username', '未知用户')}, 目标好友: {user['targets']}"
+                f"用户: {user.get('username', '未知用户')}, 目标好友: "
+                f"{[t['id'] for t in user['targets']]}"
             )
         for user in userData:
             cookies = user["cookies"]
