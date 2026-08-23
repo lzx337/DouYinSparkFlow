@@ -55,8 +55,11 @@ def get_config():
         "friendListTimeout": int(os.getenv("FRIEND_LIST_WAIT_TIME", "2000")),  # 好友列表加载超时时间，单位毫秒
         "taskRetryTimes": int(os.getenv("TASK_RETRY_TIMES", "3")),  # 任务重试次数
         "logLevel": os.getenv("LOG_LEVEL", "DEBUG"),  # 日志级别
-        # 发送确认用的气泡选择器：需要在真实登录页人工核对后填入，缺省不启用气泡确认
-        "outgoingBubbleSelector": os.getenv("OUTGOING_BUBBLE_SELECTOR", ""),
+        # 发送确认用的气泡选择器：真实登录页已核实为 .MessageItemTextisFromMe
+        # （仅命中本人文本气泡，方向性稳定；空串注入时也回退到该默认值，保证确认开启）
+        "outgoingBubbleSelector": os.getenv("OUTGOING_BUBBLE_SELECTOR") or ".MessageItemTextisFromMe",
+        # 发送失败标记选择器：尚未在真实 DOM 观察到稳定的失败标记类，缺省不启用
+        # （不猜测，避免误判发送失败）
         "failedBubbleSelector": os.getenv("FAILED_BUBBLE_SELECTOR", ""),
         # 会话表头标题选择器：真实页面核实后填入；不填则用推断列表，读不到表头时宁可跳过也不发送
         "chatHeaderTitleSelector": os.getenv("CHAT_HEADER_TITLE_SELECTOR", ""),
