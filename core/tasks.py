@@ -6,7 +6,7 @@ from playwright.sync_api import Response, TimeoutError as PlaywrightTimeoutError
 
 from core.browser import get_browser
 from core.msg_builder import build_message
-from utils import norm, strict_title_match, title_matches_aliases
+from utils import norm, strict_title_match
 from utils.config import get_config, get_userData
 from utils.logger import setup_logger
 
