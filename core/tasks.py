@@ -253,10 +253,12 @@ def wait_for_chat_ready(page, username):
     # 最终必须停留在 /chat；若被重定向到登录 / 验证页，安全停止该账号
     if "/chat" not in page.url:
         body_text = _body_text(page)
-        if any(k in body_text for k in SECURITY_KEYWORDS):
+        matched = next((k for k in SECURITY_KEYWORDS if k in body_text), None)
+        if matched:
             dump_debug_artifacts(page, username, "login-or-verify")
             raise LoginRequired(
-                f"账号 {username} 未进入聊天页（URL={page.url!r}），疑似需要人工安全验证/登录。"
+                f"账号 {username} 未进入聊天页（URL={page.url!r}），"
+                f"疑似需要人工安全验证/登录（命中关键词 {matched!r}）。"
             )
         try:
             page.wait_for_url("**/chat**", timeout=10000)
@@ -290,15 +292,22 @@ def wait_for_chat_ready(page, username):
     diag = list_diagnostics(page)
     logger.warning(f"账号 {username} 聊天列表未渲染（诊断: {diag}）")
 
-    if any(k in body_text for k in SECURITY_KEYWORDS):
+    # 已停留在 /chat：只有强验证关键词才判 LoginRequired；裸「登录」太泛，
+    # 可能是页面文案里的普通词，不足以证明会话失效（仍会走下面的 ChatUnavailable 安全停止）
+    strong = ("安全验证", "验证码", "短信验证")
+    matched = next((k for k in strong if k in body_text), None)
+    if matched:
         raise LoginRequired(
-            f"账号 {username} 未进入聊天列表，疑似 Cookie 失效或需要人工安全验证。"
+            f"账号 {username} 未进入聊天列表，疑似 Cookie 失效或需要人工安全验证"
+            f"（命中关键词 {matched!r}）。"
         )
+    weak = "登录" in body_text
 
     # 区别于 LoginRequired：已停留在 /chat，但列表未渲染/不可见。
     # 可能是云端 headless 降级态或慢加载。不再继续等，安全中止该账号（宁可不发也不误发）。
     raise ChatUnavailable(
-        f"账号 {username} 停留在聊天页但列表未渲染/不可见（页面标题: {title!r}），中止该账号"
+        f"账号 {username} 停留在聊天页但列表未渲染/不可见"
+        f"（页面标题: {title!r}, 含登录字样的弱信号: {weak}），中止该账号"
     )
 
 
@@ -421,6 +430,26 @@ def visible_titles(page, item_selector):
     return tuple(out)
 
 
+def log_visible_conversation_titles(page, username, item_selector, limit=15):
+    """DRY_RUN 只读诊断：记录当前可见会话项的标题（norm + 截断到 40 字符）。
+
+    只记录用户自己的联系人显示名——这是把 unique_id 目标映射到真实显示名
+    所必需的配置数据，不记录消息内容/页面全文/Cookie。上限 limit 项。
+    """
+    titles = []
+    for i in range(min(page.locator(item_selector).count(), limit)):
+        try:
+            el = page.locator(item_selector).nth(i)
+            if not el.is_visible():
+                continue
+            t = get_item_title(el)
+            if t:
+                titles.append(norm(t)[:40])
+        except Exception:
+            continue
+    logger.info(f"账号 {username} [DRY_RUN] 当前可见会话标题: {titles}")
+
+
 def list_diagnostics(page, limit=8):
     """只读：返回会话列表候选元素的结构诊断（selector/index/是否可见/位置）。
 
@@ -445,13 +474,27 @@ def list_diagnostics(page, limit=8):
     return result
 
 
+_SCROLLER_WALK_JS = """(element) => {
+    let node = element;
+    while (node && node !== document.body) {
+        const style = getComputedStyle(node);
+        if (/(auto|scroll)/.test(style.overflowY)) {
+            return node;
+        }
+        node = node.parentElement;
+    }
+    return element;
+}"""
+
+
 def find_real_scroller(page, timeout_ms=8000):
     """从所有列表候选里重新扫描当前可见元素，找到其可滚动祖先。
 
     不再把 list_selector 字符串传进来再 `.first` 查一次——虚拟列表可能替换节点、
     覆盖层可能改变 DOM 顺序。每次需要滚动时都重新扫描，取当前可见的候选。
     刻意不以 scrollHeight > clientHeight 为前提：虚拟列表不一定反映完整高度。
-    找不到返回 None，调用方应据此判定 chat_unavailable 并中止账号。
+    先扫列表 wrapper 候选；未命中时再兜底从可见会话项向上找（wrapper 选择器
+    可能对不上真实结构，但 item 选择器能命中）。找不到返回 None。
     """
     deadline = time.time() + timeout_ms / 1000.0
     while time.time() < deadline:
@@ -465,20 +508,23 @@ def find_real_scroller(page, timeout_ms=8000):
                     handle = wrapper.element_handle()
                     if handle is None:
                         continue
-                    scroll_handle = handle.evaluate_handle(
-                        """(element) => {
-                            let node = element;
-                            while (node && node !== document.body) {
-                                const style = getComputedStyle(node);
-                                if (/(auto|scroll)/.test(style.overflowY)) {
-                                    return node;
-                                }
-                                node = node.parentElement;
-                            }
-                            return element;
-                        }"""
-                    )
-                    scroller = scroll_handle.as_element()
+                    scroller = handle.evaluate_handle(_SCROLLER_WALK_JS).as_element()
+                    if scroller:
+                        return scroller
+                except Exception:
+                    continue
+        # 兜底：wrapper 选择器未命中时，从可见会话项向上找滚动祖先
+        for selector in CONVERSATION_ITEM_SELECTORS:
+            loc = page.locator(selector)
+            for i in range(min(loc.count(), 12)):
+                item = loc.nth(i)
+                try:
+                    if not item.is_visible():
+                        continue
+                    handle = item.element_handle()
+                    if handle is None:
+                        continue
+                    scroller = handle.evaluate_handle(_SCROLLER_WALK_JS).as_element()
                     if scroller:
                         return scroller
                 except Exception:
@@ -825,6 +871,9 @@ def do_user_task(browser, username, cookies, targets):
         item_selector = resolve_item_selector(page)
         search = find_search_box(page, username)
         logger.debug(f"账号 {username} 搜索框可用: {search is not None}")
+        if config.get("dryRun"):
+            # 只读诊断：记录可见会话标题，用于把 unique_id 目标映射到真实显示名
+            log_visible_conversation_titles(page, username, item_selector)
 
         not_found = []
         unverified = []
