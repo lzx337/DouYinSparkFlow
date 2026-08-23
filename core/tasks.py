@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import traceback
 
@@ -170,6 +171,64 @@ def dump_debug_artifacts(page, username, reason):
     logger.warning(
         f"已保存调试文件: {base_path}.png / {base_path}.txt，当前 URL: {page.url}"
     )
+
+
+def _compact_clean(s):
+    """极致归一：norm 后再去掉字面转义序列与全部空白，只保留内容字符。
+
+    抖音编辑器会把消息里的字面 \\n 混成「真实换行 + 字面 \\n」，气泡 inner_text 与
+    列表预览 textContent 呈现各不相同；去掉一切空白与字面转义后，同一消息在不同
+    渲染下都能对上。
+    """
+    s = norm(s)
+    s = s.replace("\\n", "").replace("\\r", "").replace("\\t", "")
+    return "".join(ch for ch in s if not ch.isspace())
+
+
+def visible_compact(s):
+    """先去 [表情码]（气泡里渲染成图片，inner_text 会丢失），再极致归一。"""
+    if s is None:
+        return ""
+    if not isinstance(s, str):
+        s = str(s)
+    return _compact_clean(re.sub(r"\[[^\[\]]{1,12}\]", "", s))
+
+
+def read_conversation_item_state(page, item_selector, wanted_set):
+    """只读：按标题精确匹配目标会话项，返回 (time_str, preview, preview_compact)。
+
+    - time_str：最近消息时间，如「刚刚 / 20:42」。发送后目标条目必然翻转为「刚刚」，
+      布局无关，实测可靠。
+    - preview：列表预览 textContent（保留表情码原文与字面 \\n；刚发送后可能为省略号 …）
+    - preview_compact：preview 去表情码并极致归一，用于跨渲染差异对比
+    找不到（列表被 SearchPanel 覆盖 / 未渲染）返回 ("", "", "")，调用方自行降级。
+    """
+    for i in range(page.locator(item_selector).count()):
+        try:
+            el = page.locator(item_selector).nth(i)
+            if not el.is_visible():
+                continue
+            title = get_item_title(el)
+            if not title or norm(title) not in wanted_set:
+                continue
+            time_str = ""
+            try:
+                t_el = el.locator("[class*='timeStr']").first
+                if t_el.count():
+                    time_str = t_el.inner_text(timeout=1000).strip()
+            except Exception:
+                pass
+            preview = ""
+            try:
+                d_el = el.locator("[class*='ConversationItemDesc']").first
+                if d_el.count():
+                    preview = (d_el.evaluate("(e) => (e.textContent || '')") or "").strip()
+            except Exception:
+                pass
+            return time_str, preview, visible_compact(preview)
+        except Exception:
+            continue
+    return "", "", ""
 
 
 def wait_for_chat_ready(page, username):
@@ -508,38 +567,46 @@ def read_chat_header_title(page, wait_seconds=5):
     return ""
 
 
-def should_skip_duplicate(before_count, before_last_text, norm_msg):
-    """发送前去重（纯逻辑）：最后一条本人文本气泡已是相同内容 -> True（跳过发送）。"""
-    return before_count > 0 and bool(before_last_text) and before_last_text == norm_msg
+def already_present(norm_msg, before_preview, before_last_text):
+    """发送前去重（纯逻辑）：预览或最后一条本人气泡已是相同内容 -> True（跳过发送）。"""
+    if before_preview and visible_compact(before_preview) == visible_compact(norm_msg):
+        return True
+    if before_last_text and visible_compact(before_last_text) == visible_compact(norm_msg):
+        return True
+    return False
 
 
-def outgoing_confirm_verdict(norm_msg, before_last_text, last_text):
-    """发送确认决策（纯逻辑）：返回 "sent" / "unverified" / "failed"。
+def confirm_signals(norm_msg, before_ts, before_preview, now_ts, now_preview, bubble_text):
+    """多信号发送确认（纯逻辑）：任一命中 -> True（可确认本次已发送）。
 
-    - last_text == norm_msg 且 发送前最后一条不是相同内容 -> "sent"（新气泡出现且内容匹配）
-    - 发送前最后一条已是相同内容（无法区分新旧）-> "unverified"（绝不宣称成功）
-    - 其他 -> "failed"
+    信号（按可靠性）：
+    A. 列表预览内容 == 消息（预览保留表情码原文，跨换行差异可对比）-> 最强
+    B. 目标条目时间戳翻转为「刚刚」且发送前不是「刚刚」-> 布局无关，实测可靠
+    C. 消息面板本人气泡去表情码后 == 消息 -> 兜底
+    全部未命中 -> False。调用方应据此返回 "unverified"，绝不宣称失败，避免人类误重发。
     """
-    if last_text and norm_msg and last_text == norm_msg and before_last_text != norm_msg:
-        return "sent"
-    if before_last_text and before_last_text == norm_msg:
-        return "unverified"
-    return "failed"
+    if now_preview and visible_compact(now_preview) == visible_compact(norm_msg):
+        return True
+    if before_ts and before_ts != "刚刚" and now_ts == "刚刚":
+        return True
+    if bubble_text and visible_compact(bubble_text) == visible_compact(norm_msg):
+        return True
+    return False
 
 
-def send_chat_message(page, username, target, config):
-    """发送前二次确认 -> 去重 -> 输入 -> 发送 -> 文字匹配确认。
+def send_chat_message(page, username, target, config, item_selector):
+    """发送前去重 -> 输入 -> 发送 -> 多信号确认。
 
     返回 (状态, 详情)：
-      ("sent", None)            已确认发送成功（最后一条本人气泡内容 == 消息）
-      ("unverified", reason)    已尝试发送但无法可靠确认，绝不自动重发
-      ("failed", reason)        明确失败（相同内容已存在 / 失败标记 / 气泡内容未匹配）
+      ("sent", None)            多信号任一命中（预览匹配 / 时间戳翻转为「刚刚」/ 气泡匹配）
+      ("unverified", reason)    已尝试发送但无法可靠确认——绝不自动重发，绝不宣称失败
+      ("failed", reason)        明确失败（相同内容已存在 / 未配置气泡选择器 / 无输入框）
     若检测到安全验证，抛 LoginRequired 安全停止该账号。
 
-    虚拟列表说明：会话消息是虚拟滚动的，DOM 只渲染可视窗口，本人气泡「计数」随滚动
-    窗口漂移，不能用来判断发送成功。因此改为确认「最后一条本人文本气泡的内容 == 消息
-    内容」（发送后新气泡必然出现在窗口底部）。发送前若最后一条已是相同内容，跳过发送
-    避免重复。
+    确认信号设计（实测）：消息面板气泡文本因表情码渲染成图片、编辑器把 \\n 混成真实
+    换行+字面 \\n、列表虚拟化只渲染可视窗口，纯气泡文本匹配不可靠。改用
+    「列表预览 textContent（保留表情码原文）+ 目标条目时间戳翻转为「刚刚」」为主信号，
+    气泡去表情码后的极致归一对比为兜底。全部未命中 -> "unverified"（诚实，防误重发）。
     """
     body_text = _body_text(page, 2000)
     if any(k in body_text for k in ("安全验证", "验证码", "短信验证")):
@@ -552,24 +619,10 @@ def send_chat_message(page, username, target, config):
         return "failed", "未找到聊天输入框"
 
     outgoing_sel = config.get("outgoingBubbleSelector") or ""
-    failed_sel = config.get("failedBubbleSelector") or ""
 
     # 无法可靠定位本人气泡 -> 不发送（宁漏发）
     if not outgoing_sel:
         return "failed", "未配置 outgoingBubbleSelector"
-
-    # 发送前记录最后一条本人文本气泡内容与数量（仅用于去重与辅助判断）
-    before_count = -1
-    before_last_text = ""
-    try:
-        before_count = page.locator(outgoing_sel).count()
-        if before_count > 0:
-            before_last_text = norm(
-                page.locator(outgoing_sel).nth(before_count - 1).inner_text(timeout=2000)
-            )
-    except Exception:
-        logger.warning(f"账号 {username} 无法读取本人气泡（选择器 {outgoing_sel!r}）")
-        before_count = -1
 
     message = build_message()
     norm_msg = norm(message)
@@ -577,9 +630,24 @@ def send_chat_message(page, username, target, config):
         logger.warning(f"账号 {username} 消息内容为空，跳过发送")
         return "failed", "消息内容为空"
 
-    # 发送前去重：最后一条本人文本气泡已是相同内容 -> 跳过，绝不重复发
-    if should_skip_duplicate(before_count, before_last_text, norm_msg):
-        logger.warning(f"账号 {username} 最后一条本人消息已是相同内容，跳过发送避免重复")
+    # 发送前读取目标会话项状态（时间戳 + 预览），作为去重与确认基准
+    wanted_set = set(target["title_aliases_norm"])
+    before_ts, before_preview, _ = read_conversation_item_state(
+        page, item_selector, wanted_set
+    )
+    before_last_text = ""
+    try:
+        cnt = page.locator(outgoing_sel).count()
+        if cnt > 0:
+            before_last_text = norm(
+                page.locator(outgoing_sel).nth(cnt - 1).inner_text(timeout=2000)
+            )
+    except Exception:
+        logger.warning(f"账号 {username} 无法读取本人气泡（选择器 {outgoing_sel!r}）")
+
+    # 发送前去重：预览或最后一条本人气泡已是相同内容 -> 跳过，绝不重复发
+    if already_present(norm_msg, before_preview, before_last_text):
+        logger.warning(f"账号 {username} 目标会话已存在相同内容，跳过发送避免重复")
         return "failed", "相同内容已存在，跳过避免重复"
 
     lines = message.replace("\\\\n", chr(10)).splitlines() or [message]
@@ -591,42 +659,36 @@ def send_chat_message(page, username, target, config):
     chat_input.press("Enter")
     logger.debug(f"账号 {username} 已按下发送")
 
-    # 文字匹配确认：轮询最后一条本人文本气泡 == 消息内容（且 != 发送前最后一条，
-    # 以排除「发送前已是相同内容」的极端场景——那种情况上方已跳过发送，不会到达这里）
+    # 多信号确认：预览内容匹配 / 时间戳翻转为「刚刚」/ 气泡去表情码后匹配
     deadline = time.time() + 15
-    last_text = ""
     while time.time() < deadline:
         time.sleep(1)
         try:
-            cnt = page.locator(outgoing_sel).count()
-            if cnt == 0:
-                continue
-            last_text = norm(
-                page.locator(outgoing_sel).nth(cnt - 1).inner_text(timeout=2000)
+            now_ts, now_preview, _ = read_conversation_item_state(
+                page, item_selector, wanted_set
             )
-            if last_text == norm_msg and before_last_text != norm_msg:
-                if failed_sel:
-                    try:
-                        last_el = page.locator(outgoing_sel).nth(cnt - 1)
-                        if last_el.locator(failed_sel).count() > 0:
-                            logger.warning(f"账号 {username} 检测到发送失败标记")
-                            return "failed", "失败标记"
-                    except Exception:
-                        pass
-                logger.info(f"账号 {username} 消息发送成功并确认（最后一条本人气泡内容匹配）")
+            bubble_last = ""
+            cnt = page.locator(outgoing_sel).count()
+            if cnt > 0:
+                try:
+                    bubble_last = norm(
+                        page.locator(outgoing_sel).nth(cnt - 1).inner_text(timeout=2000)
+                    )
+                except Exception:
+                    bubble_last = ""
+            if confirm_signals(
+                norm_msg, before_ts, before_preview, now_ts, now_preview, bubble_last
+            ):
+                logger.info(f"账号 {username} 消息发送成功并确认")
                 return "sent", None
         except Exception:
             continue
 
-    verdict = outgoing_confirm_verdict(norm_msg, before_last_text, last_text)
-    if verdict == "unverified":
-        # 理论上不会到这：上方已跳过。若因并发到达，也绝不宣称成功
-        logger.warning(f"账号 {username} 发送前最后一条已是相同内容，无法确认本次新增，返回 unverified")
-        return "unverified", "发送前已有相同内容，无法确认本次新增"
-
-    dump_debug_artifacts(page, username, "bubble-text-not-matched")
-    logger.warning(f"账号 {username} 发送后未发现本人气泡内容匹配，判定发送失败")
-    return "failed", "气泡内容未匹配"
+    dump_debug_artifacts(page, username, "send-unverified")
+    logger.warning(
+        f"账号 {username} 已尝试发送但无法可靠确认（时间戳/预览/气泡均未命中），返回 unverified"
+    )
+    return "unverified", "发送后未能可靠确认，请人工核实后决定是否重发"
 
 
 def do_user_task(browser, username, cookies, targets):
@@ -715,7 +777,7 @@ def do_user_task(browser, username, cookies, targets):
                 continue
 
             try:
-                result, detail = send_chat_message(page, username, target, config)
+                result, detail = send_chat_message(page, username, target, config, item_selector)
                 if result == "sent":
                     logger.info(f"账号 {username} 已向 {target_id} 发送并确认")
                 elif result == "unverified":
