@@ -14,27 +14,6 @@ jobs:
         with:
           ref: dev
 
-      - name: Load Cookie (手机文件优先 -> Secrets 兜底)
-        run: |
-          if [ -f .github/cookie_data.json ]; then
-            echo "从 cookie_data.json 读取 Cookie"
-            {
-              echo "COOKIES_DYQIJ1ANHNPE<<EOF"
-              cat .github/cookie_data.json
-              echo "EOF"
-            } >> $GITHUB_ENV
-          elif [ -n "${{ secrets.COOKIES_DYQIJ1ANHNPE }}" ]; then
-            echo "从 Secrets 读取 Cookie"
-            {
-              echo "COOKIES_DYQIJ1ANHNPE<<EOF"
-              echo '${{ secrets.COOKIES_DYQIJ1ANHNPE }}'
-              echo "EOF"
-            } >> $GITHUB_ENV
-          else
-            echo "没有找到任何 Cookie 来源"
-            exit 1
-          fi
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -48,17 +27,13 @@ jobs:
           pip install -r requirements.txt
           playwright install chromium
 
-      - name: Run task
+      - name: Export GitHub Variables and Secrets to env
         env:
-          BROWSER_TIMEOUT: "${{ vars.BROWSER_TIMEOUT }}"
-          FRIEND_LIST_WAIT_TIME: "${{ vars.FRIEND_LIST_WAIT_TIME }}"
-          HITOKOTO_TYPES: "${{ vars.HITOKOTO_TYPES }}"
-          LOG_LEVEL: "${{ vars.LOG_LEVEL }}"
-          MATCH_MODE: "${{ vars.MATCH_MODE }}"
-          MESSAGE_TEMPLATE: "${{ vars.MESSAGE_TEMPLATE }}"
-          TASKS: "${{ vars.TASKS }}"
-          TASK_RETRY_TIMES: "${{ vars.TASK_RETRY_TIMES }}"
-          PROXY_ADDRESS: "${{ vars.PROXY_ADDRESS }}"
+          VARS_JSON: ${{ toJson(vars) }}
+          SECRETS_JSON: ${{ toJson(secrets) }}
+        run: python utils/export_github_env.py
+
+      - name: Run task
         run: python main.py
 
       - name: Upload debug logs
