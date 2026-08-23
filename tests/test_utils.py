@@ -2,7 +2,7 @@
 """utils/__init__.py 的单元测试：norm、严格标题匹配。"""
 import unittest
 
-from utils import norm, strict_title_match, title_matches_aliases
+from utils import norm, norm_tight, strict_title_match, title_matches_aliases
 
 
 class TestNorm(unittest.TestCase):
@@ -29,6 +29,18 @@ class TestNorm(unittest.TestCase):
     def test_pua_apple_logo_kept(self):
         # PUA 字符无兼容分解，norm 保留它；两侧若都带该字符则相等，可精确匹配
         self.assertEqual(norm("Liu Beixi"), "Liu Beixi")
+
+
+class TestNormTight(unittest.TestCase):
+    def test_removes_all_whitespace(self):
+        # 搜索结果标题常渲染成 '期安 (路心月)'（换行变空格），别名是 '期安(路心月)'
+        self.assertEqual(norm_tight("期安 (路心月)"), "期安(路心月)")
+        self.assertEqual(norm_tight("  A\tB\n\nC  "), "ABC")
+
+    def test_still_nfkc_and_strips_pua(self):
+        self.assertEqual(norm_tight("𝓓𝓻𝓮𝓪𝓶. (罗致蘅)"), "Dream.(罗致蘅)")
+        # norm_tight 会移除所有空白（包括昵称内部空格），PUA 苹果标保留
+        self.assertEqual(norm_tight("Liu Beixi"), "LiuBeixi")
 
 
 class TestStrictTitleMatch(unittest.TestCase):
