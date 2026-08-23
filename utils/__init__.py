@@ -18,6 +18,15 @@ def norm(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
+def norm_tight(s):
+    """norm 后再移除所有空白（含换行产生的空格）。
+
+    搜索结果标题常把「昵称(备注)」渲染成换行/带空格，如 '期安 (路心月)'，
+    而别名是 '期安(路心月)'。列表标题与别名用 norm 即可；搜索结果匹配用本函数。
+    """
+    return "".join(norm(s).split())
+
+
 def strict_title_match(title, title_aliases):
     """发送前表头确认：norm(title) 必须与某个别名 norm 后完全相等。
 
