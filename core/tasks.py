@@ -181,13 +181,45 @@ def get_item_title(element):
         return ""
 
 
+def scroll_list_container(page, list_selector, by=800):
+    """在页面内从列表容器向上找真正可滚动的元素（scrollHeight > clientHeight），滚动 by 像素。
+
+    抖音聊天列表是虚拟滚动，实际滚动容器可能是列表 wrapper 的某个祖先/子元素。
+    返回 {ok, before, after, sh, ch} 便于判断是否真的滚动了。
+    """
+    try:
+        return page.evaluate(
+            """(sel, by) => {
+                let el = document.querySelector(sel);
+                const candidates = [];
+                while (el && candidates.length < 8) {
+                    if (el.scrollHeight > el.clientHeight + 20) candidates.push(el);
+                    el = el.parentElement;
+                }
+                if (!candidates.length) return {ok: false, msg: 'no-scrollable'};
+                candidates.sort((a, b) =>
+                    (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
+                const c = candidates[0];
+                const before = c.scrollTop;
+                c.scrollTop = Math.min(c.scrollTop + by, c.scrollHeight);
+                return {ok: true, before: before, after: c.scrollTop,
+                        sh: c.scrollHeight, ch: c.clientHeight};
+            }""",
+            list_selector,
+            by,
+        )
+    except Exception as e:
+        logger.warning(f"账号滚动列表失败: {e}")
+        return {"ok": False, "msg": "exception"}
+
+
 def scroll_and_select_user(page, username, targets, list_selector):
     logger.debug(f"账号 {username} 开始查找目标好友列表")
     logger.debug(f"账号 {username} 目标好友列表: {targets}")
     found_targets = set()
     remaining_targets = set(targets)
     empty_scroll_count = 0
-    max_empty_scrolls = 10
+    max_empty_scrolls = 15
     item_selector = CONVERSATION_ITEM_SELECTORS[0]
 
     for selector in CONVERSATION_ITEM_SELECTORS:
@@ -236,38 +268,30 @@ def scroll_and_select_user(page, username, targets, list_selector):
                     logger.warning(
                         f"账号 {username} 搜索结束，仍有以下好友未找到: {remaining_targets}"
                     )
+                # 全量标题日志：便于排查是列表没加载全，还是标题不匹配
+                logger.info(
+                    f"账号 {username} 枚举到的全部标题({len(found_targets)}): {sorted(found_targets)}"
+                )
                 break
 
-            try:
-                scrollable_element = page.locator(list_selector).first.element_handle(timeout=3000)
-            except PlaywrightTimeoutError:
-                logger.error(f"账号 {username} 未找到滚动容器，退出")
+            result = scroll_list_container(page, list_selector)
+            if not result.get("ok"):
+                logger.error(f"账号 {username} 未找到可滚动容器，退出")
                 dump_debug_artifacts(page, username, "scroll-container-not-found")
                 break
-
-            if scrollable_element:
-                scroll_top_before = page.evaluate(
-                    "(element) => element.scrollTop", scrollable_element
+            if result["before"] == result["after"]:
+                empty_scroll_count += 2
+                logger.debug(
+                    f"账号 {username} scrollTop 未变化 ({result['before']})，可能已到底 "
+                    f"(空滚动计数: {empty_scroll_count}/{max_empty_scrolls})"
                 )
-                page.evaluate(
-                    "(element) => element.scrollTop += 800", scrollable_element
+            else:
+                logger.debug(
+                    f"账号 {username} 滚动好友列表以加载更多好友 "
+                    f"(scrollTop: {result['before']} -> {result['after']}, "
+                    f"容器 {result['sh']}/{result['ch']})"
                 )
-                time.sleep(0.3)
-                scroll_top_after = page.evaluate(
-                    "(element) => element.scrollTop", scrollable_element
-                )
-                if scroll_top_before == scroll_top_after:
-                    empty_scroll_count += 2
-                    logger.debug(
-                        f"账号 {username} scrollTop 未变化 ({scroll_top_before})，可能已到底 "
-                        f"(空滚动计数: {empty_scroll_count}/{max_empty_scrolls})"
-                    )
-                else:
-                    logger.debug(
-                        f"账号 {username} 滚动好友列表以加载更多好友 "
-                        f"(scrollTop: {scroll_top_before} -> {scroll_top_after})"
-                    )
-                time.sleep(1.5)
+            time.sleep(1.5)
 
 
 def do_user_task(browser, username, cookies, targets):
