@@ -123,6 +123,34 @@ class TestParseTargets(unittest.TestCase):
         self.assertEqual(out[1]["title_aliases_norm"], ["Liu Beixi"])
 
 
+class TestDryRunConfig(unittest.TestCase):
+    """DRY_RUN 只读诊断模式：发送前停止，绝不误发。"""
+
+    def setUp(self):
+        utils.config.config = None
+        utils.config.userData = None
+        os.environ.pop("DRY_RUN", None)
+
+    def tearDown(self):
+        os.environ.pop("DRY_RUN", None)
+
+    def test_false_when_env_unset(self):
+        self.assertFalse(utils.config.get_config()["dryRun"])
+
+    def test_false_when_env_empty(self):
+        # GitHub Actions 里 var 未设置时 env 注入为空串 -> 必须是关闭
+        os.environ["DRY_RUN"] = ""
+        self.assertFalse(utils.config.get_config()["dryRun"])
+
+    def test_true_when_env_one(self):
+        os.environ["DRY_RUN"] = "1"
+        self.assertTrue(utils.config.get_config()["dryRun"])
+
+    def test_true_when_env_true(self):
+        os.environ["DRY_RUN"] = "true"
+        self.assertTrue(utils.config.get_config()["dryRun"])
+
+
 class TestOutgoingBubbleDefault(unittest.TestCase):
     """outgoingBubbleSelector 的默认值逻辑（真实 DOM 已核实为 .MessageItemTextisFromMe）。"""
 

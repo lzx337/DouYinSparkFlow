@@ -78,6 +78,14 @@ class LoginRequired(RuntimeError):
     """登录态失效或需要人工安全验证。"""
 
 
+class ChatUnavailable(RuntimeError):
+    """停留在 /chat 但聊天列表未渲染/不可滚动/不可见：页面降级或慢加载，应停止该账号。
+
+    与 LoginRequired 分开：LoginRequired 是登录/安全验证，ChatUnavailable 是页面就绪问题。
+    两者都停止该账号，不继续逐目标匹配浪费超时。
+    """
+
+
 def make_handle_response(userIDDict):
     """返回绑定到指定账号 userIDDict 的响应处理器。
 
@@ -258,7 +266,14 @@ def wait_for_chat_ready(page, username):
             dump_debug_artifacts(page, username, "not-chat-url")
             raise LoginRequired(f"账号 {username} 未停留在聊天页（URL={page.url!r}）。")
 
-    list_selector, _ = first_visible_locator(page, CONVERSATION_LIST_SELECTORS, timeout=15000)
+    # 列表必须渲染出来：最多等 30s。每次轮询所有候选，防止单个选择器串行超时放大总等待
+    list_selector = None
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        list_selector, _ = first_visible_locator(page, CONVERSATION_LIST_SELECTORS, timeout=4000)
+        if list_selector:
+            break
+        time.sleep(0.5)
     if list_selector:
         logger.debug(f"账号 {username} 聊天列表已加载，选择器: {list_selector}")
         return list_selector
@@ -272,14 +287,18 @@ def wait_for_chat_ready(page, username):
 
     dump_debug_artifacts(page, username, "chat-list-not-found")
 
+    diag = list_diagnostics(page)
+    logger.warning(f"账号 {username} 聊天列表未渲染（诊断: {diag}）")
+
     if any(k in body_text for k in SECURITY_KEYWORDS):
         raise LoginRequired(
             f"账号 {username} 未进入聊天列表，疑似 Cookie 失效或需要人工安全验证。"
         )
 
-    raise RuntimeError(
-        f"账号 {username} 未找到聊天列表。页面标题: {title!r}，"
-        f"页面文本片段: {body_text!r}"
+    # 区别于 LoginRequired：已停留在 /chat，但列表未渲染/不可见。
+    # 可能是云端 headless 降级态或慢加载。不再继续等，安全中止该账号（宁可不发也不误发）。
+    raise ChatUnavailable(
+        f"账号 {username} 停留在聊天页但列表未渲染/不可见（页面标题: {title!r}），中止该账号"
     )
 
 
@@ -402,42 +421,87 @@ def visible_titles(page, item_selector):
     return tuple(out)
 
 
-def find_real_scroller(page, list_selector):
-    """从列表容器向上找到真正可滚动的元素（overflowY auto/scroll 且 scrollHeight>clientHeight）。"""
-    try:
-        wrapper = page.locator(list_selector).first
-        wrapper.wait_for(state="visible", timeout=20000)
-        handle = wrapper.evaluate_handle(
-            """(element) => {
-                let node = element;
-                while (node && node !== document.body) {
-                    const style = getComputedStyle(node);
-                    const scrollable = /(auto|scroll)/.test(style.overflowY)
-                        && node.scrollHeight > node.clientHeight + 2;
-                    if (scrollable) return node;
-                    node = node.parentElement;
-                }
-                return element;
-            }"""
-        )
-        return handle.as_element()
-    except Exception as e:
-        logger.warning(f"查找滚动容器失败: {e}")
-        return None
+def list_diagnostics(page, limit=8):
+    """只读：返回会话列表候选元素的结构诊断（selector/index/是否可见/位置）。
+
+    只记录结构，不记录页面文本内容。用于判断「列表未渲染 / 被覆盖 / 定位竞态」。
+    """
+    result = []
+    for selector in CONVERSATION_LIST_SELECTORS:
+        loc = page.locator(selector)
+        for i in range(min(loc.count(), limit)):
+            item = loc.nth(i)
+            try:
+                result.append(
+                    {
+                        "selector": selector,
+                        "index": i,
+                        "visible": item.is_visible(),
+                        "box": item.bounding_box(),
+                    }
+                )
+            except Exception:
+                result.append({"selector": selector, "index": i, "error": True})
+    return result
 
 
-def select_by_virtual_list(page, username, target, list_selector, item_selector):
+def find_real_scroller(page, timeout_ms=8000):
+    """从所有列表候选里重新扫描当前可见元素，找到其可滚动祖先。
+
+    不再把 list_selector 字符串传进来再 `.first` 查一次——虚拟列表可能替换节点、
+    覆盖层可能改变 DOM 顺序。每次需要滚动时都重新扫描，取当前可见的候选。
+    刻意不以 scrollHeight > clientHeight 为前提：虚拟列表不一定反映完整高度。
+    找不到返回 None，调用方应据此判定 chat_unavailable 并中止账号。
+    """
+    deadline = time.time() + timeout_ms / 1000.0
+    while time.time() < deadline:
+        for selector in CONVERSATION_LIST_SELECTORS:
+            loc = page.locator(selector)
+            for i in range(min(loc.count(), 12)):
+                wrapper = loc.nth(i)
+                try:
+                    if not wrapper.is_visible():
+                        continue
+                    handle = wrapper.element_handle()
+                    if handle is None:
+                        continue
+                    scroll_handle = handle.evaluate_handle(
+                        """(element) => {
+                            let node = element;
+                            while (node && node !== document.body) {
+                                const style = getComputedStyle(node);
+                                if (/(auto|scroll)/.test(style.overflowY)) {
+                                    return node;
+                                }
+                                node = node.parentElement;
+                            }
+                            return element;
+                        }"""
+                    )
+                    scroller = scroll_handle.as_element()
+                    if scroller:
+                        return scroller
+                except Exception:
+                    continue
+        time.sleep(0.25)
+    return None
+
+
+def select_by_virtual_list(page, username, target, item_selector):
     """滚动兜底：真实滚动容器 + 鼠标滚轮（贴近真实用户触发虚拟列表加载）。
 
     停止条件（组合判定，缺一不可）：
     1. 目标任一别名在可见窗口中精确匹配 -> 点击返回（最高优先）
     2. 连续多轮「可见标题窗口不变 且 已见集合不再增长」-> 判定不可见并停止
     3. scrollTop 只作为辅助诊断日志，不单独作为停止依据
+
+    find_real_scroller 每次重新扫描候选；找不到滚动容器 -> 抛 ChatUnavailable
+    中止该账号（列表不可用，逐目标等 20s 只会浪费时间）。
     """
-    scroller = find_real_scroller(page, list_selector)
+    scroller = find_real_scroller(page)
     if scroller is None:
-        logger.warning(f"账号 {username} 未找到可滚动容器")
-        return None, None
+        logger.warning(f"账号 {username} 未找到可滚动容器，判定 chat_unavailable")
+        raise ChatUnavailable(f"账号 {username} 停留在聊天页但列表不可滚动/不可见")
     try:
         scroller.hover()  # 悬停在真实滚动区，wheel 事件才可能被虚拟列表捕获
     except Exception:
@@ -489,11 +553,12 @@ def select_by_virtual_list(page, username, target, list_selector, item_selector)
     return None, None
 
 
-def select_target(page, username, target, list_selector, item_selector, search):
+def select_target(page, username, target, item_selector, search):
     """主路径：搜索框精确筛选；兜底：滚动。找到并点击后返回 (True, title)，否则 (False, None)。
 
     搜索后会话列表被 SearchPanel 覆盖为 hidden，命中项在 .SearchPanelitembox 里；
     点 .SearchPanelitemchat_btn 才会真正进入会话（真实 DOM 验证）。已删除全页 get_by_text 兜底。
+    找不到滚动容器时由 select_by_virtual_list 抛 ChatUnavailable 中止该账号。
     """
     wanted_set = set(target["title_aliases_norm"])
     wanted_tight_set = set(norm_tight(a) for a in target["title_aliases"])
@@ -505,6 +570,16 @@ def select_target(page, username, target, list_selector, item_selector, search):
             except Exception as e:
                 logger.debug(f"账号 {username} 搜索输入 {term!r} 失败: {e}")
                 continue
+            # 搜索诊断：只记录结构/计数，不记录完整页面文本（用于区分「搜索框不存在」vs「标题不匹配」）
+            try:
+                logger.info(
+                    f"账号 {username} 搜索诊断: target={target['id']!r}, term={term!r}, "
+                    f"search_box={search is not None}, "
+                    f"panel_items={page.locator(SEARCH_PANEL_ITEM_SELECTORS[0]).count()}, "
+                    f"visible_items={page.locator(item_selector).count()}"
+                )
+            except Exception:
+                pass
             # 搜索结果进 SearchPanel：在 .SearchPanelitembox 内精确匹配标题
             el, title = exact_search_panel_item(page, wanted_tight_set)
             if el is not None:
@@ -519,6 +594,21 @@ def select_target(page, username, target, list_selector, item_selector, search):
                 except Exception as e:
                     logger.warning(f"账号 {username} 点击好友 {target['id']} 失败: {e}")
                     return False, None
+            # 无精确命中：记录 SearchPanel 结果标题（限量、截断），用于诊断目标格式是否匹配
+            try:
+                titles = []
+                boxes = page.locator(SEARCH_PANEL_ITEM_SELECTORS[0])
+                for j in range(min(boxes.count(), 5)):
+                    t = boxes.nth(j).locator(SEARCH_PANEL_TITLE_SELECTORS[0]).first
+                    if t.count() > 0 and t.is_visible():
+                        titles.append(norm(t.inner_text(timeout=800).strip())[:30])
+                if titles:
+                    logger.info(
+                        f"账号 {username} 搜索无精确命中: target={target['id']!r}, term={term!r}, "
+                        f"panel_titles={titles}"
+                    )
+            except Exception:
+                pass
             # 兜底：若 SearchPanel 没出现（搜索无结果），尝试会话列表内精确匹配
             el, title = exact_visible_item(page, item_selector, wanted_set)
             if el is not None:
@@ -534,7 +624,7 @@ def select_target(page, username, target, list_selector, item_selector, search):
                 pass
             time.sleep(0.3)
 
-    el, title = select_by_virtual_list(page, username, target, list_selector, item_selector)
+    el, title = select_by_virtual_list(page, username, target, item_selector)
     if el is not None:
         try:
             el.click()
@@ -695,7 +785,8 @@ def do_user_task(browser, username, cookies, targets):
     # browser 可能是常规 browser（可 new_context()），也可能是本地已登录的 persistent_context
     owns_context = hasattr(browser, "new_context")
     if owns_context:
-        context = browser.new_context()
+        # 1440×900 更接近真实桌面会话，降低 headless 下抖音渲染降级的概率（仅常规浏览器参数，非反检测）
+        context = browser.new_context(viewport={"width": 1440, "height": 900})
     else:
         context = browser
     try:
@@ -729,13 +820,15 @@ def do_user_task(browser, username, cookies, targets):
             timeout=min(config["browserTimeout"], 60000),
         )
 
-        list_selector = wait_for_chat_ready(page, username)
+        # 就绪门禁：列表未渲染/不可见时 wait_for_chat_ready 会抛 ChatUnavailable 中止该账号
+        wait_for_chat_ready(page, username)
         item_selector = resolve_item_selector(page)
         search = find_search_box(page, username)
         logger.debug(f"账号 {username} 搜索框可用: {search is not None}")
 
         not_found = []
         unverified = []
+        dry_matched = []
         attempted = set()  # 当次运行内 at-most-once：同一 账号+目标 只尝试一次，绝不自动重发
         for target in targets:
             target_id = target["id"]
@@ -746,10 +839,11 @@ def do_user_task(browser, username, cookies, targets):
             attempted.add(key)
 
             try:
-                found, title = select_target(
-                    page, username, target, list_selector, item_selector, search
-                )
+                found, title = select_target(page, username, target, item_selector, search)
             except LoginRequired:
+                raise
+            except ChatUnavailable:
+                # 列表不可用不是单个目标的临时失败，而是整账号不可用，立即中止
                 raise
             except Exception as e:
                 logger.warning(f"账号 {username} 选择好友 {target_id} 出错: {e}")
@@ -776,6 +870,16 @@ def do_user_task(browser, username, cookies, targets):
                 not_found.append(target_id)
                 continue
 
+            # DRY_RUN：定位诊断模式。搜索/点击/表头校验全部执行完毕，但发送前停止（绝不误发）。
+            # 用于云端定位「找不到目标/表头不匹配」，只输出结果，不触碰输入框发送动作。
+            if config.get("dryRun"):
+                dry_matched.append(target_id)
+                logger.info(
+                    f"账号 {username} [DRY_RUN] 目标 {target_id!r} 表头严格匹配通过，"
+                    f"不发送（表头 {header!r}）"
+                )
+                continue
+
             try:
                 result, detail = send_chat_message(page, username, target, config, item_selector)
                 if result == "sent":
@@ -799,6 +903,8 @@ def do_user_task(browser, username, cookies, targets):
             logger.warning(f"账号 {username} 本次未找到/未发送好友: {not_found}")
         if unverified:
             logger.warning(f"账号 {username} 发送但未确认的好友: {unverified}")
+        if dry_matched:
+            logger.info(f"账号 {username} [DRY_RUN] 表头严格匹配通过但不发送: {dry_matched}")
         logger.debug(f"账号 {username} 任务完成")
     finally:
         if owns_context:
@@ -839,6 +945,8 @@ def runTasks():
                 do_user_task(browser, username, cookies, targets)
                 logger.info(f"账号 {username} 任务完成")
             except LoginRequired as e:
+                logger.warning(f"账号 {username} 中止: {e}")
+            except ChatUnavailable as e:
                 logger.warning(f"账号 {username} 中止: {e}")
             except Exception as e:
                 logger.error(f"账号 {username} 异常: {e}\n{traceback.format_exc()}")
