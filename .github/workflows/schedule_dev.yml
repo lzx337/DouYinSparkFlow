@@ -5,9 +5,19 @@ on:
   schedule:
     - cron: '7 16 * * *'
 
+# 最小权限：本工作流不需要写仓库
+permissions:
+  contents: read
+
+# 同一时间只跑一个实例，避免重复发送
+concurrency:
+  group: douyin-spark-flow-dev
+  cancel-in-progress: false
+
 jobs:
   schedule:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,19 +34,26 @@ jobs:
           pip install -r requirements.txt
           playwright install chromium
 
-      - name: Export GitHub Variables and Secrets to env
-        env:
-          VARS_JSON: ${{ toJson(vars) }}
-          SECRETS_JSON: ${{ toJson(secrets) }}
-        run: python utils/export_github_env.py
-
+      # 只显式注入白名单变量：任务清单来自 vars，各账号 Cookie 来自 secrets。
+      # 不再把全部 vars/secrets 导出成 JSON/.env 后全量注入（避免无谓泄露面）。
       - name: Run task
+        env:
+          TASKS: ${{ vars.TASKS }}
+          COOKIES_DYQIJ1ANHNPE: ${{ secrets.COOKIES_DYQIJ1ANHNPE }}
+          COOKIES_AONANANIDEGU: ${{ secrets.COOKIES_AONANANIDEGU }}
+          # 发送确认/表头确认的选择器（vars，需在真实登录页核实后配置；缺省则对应功能关闭）
+          OUTGOING_BUBBLE_SELECTOR: ${{ vars.OUTGOING_BUBBLE_SELECTOR }}
+          FAILED_BUBBLE_SELECTOR: ${{ vars.FAILED_BUBBLE_SELECTOR }}
+          CHAT_HEADER_TITLE_SELECTOR: ${{ vars.CHAT_HEADER_TITLE_SELECTOR }}
         run: python main.py
 
+      # 只失败时上传：脱敏文本日志（.txt） + 截图（.png），不含完整 HTML / .env / Cookie
       - name: Upload debug logs
-        if: ${{ !cancelled() }}
+        if: ${{ failure() }}
         uses: actions/upload-artifact@v4
         with:
           name: run-logs
-          path: logs/
+          path: |
+            logs/**/*.txt
+            logs/**/*.png
           if-no-files-found: ignore
