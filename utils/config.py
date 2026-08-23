@@ -58,6 +58,8 @@ def get_config():
         # 发送确认用的气泡选择器：需要在真实登录页人工核对后填入，缺省不启用气泡确认
         "outgoingBubbleSelector": os.getenv("OUTGOING_BUBBLE_SELECTOR", ""),
         "failedBubbleSelector": os.getenv("FAILED_BUBBLE_SELECTOR", ""),
+        # 会话表头标题选择器：真实页面核实后填入；不填则用推断列表，读不到表头时宁可跳过也不发送
+        "chatHeaderTitleSelector": os.getenv("CHAT_HEADER_TITLE_SELECTOR", ""),
     }
 
     return config
@@ -194,16 +196,23 @@ def get_userData():
             continue
         cookies_key = f"cookies_{unique_id}".upper()
         cookies_str = os.getenv(cookies_key, "")
+        cookies = None
         if not cookies_str:
-            logger.warning(
-                f"{username} 的任务缺少 {cookies_key} 环境变量，已跳过"
-            )
-            continue
-        try:
-            cookies = json.loads(cookies_str)
-        except json.JSONDecodeError:
-            logger.warning(f"{username} 的任务 {cookies_key} 格式不正确，已跳过")
-            continue
+            # 仅本地 + 指定了 DOUYIN_PROFILE_PATH 时允许无 Cookie：登录态在 profile 里
+            if get_environment() == Environment.LOCAL and os.getenv("DOUYIN_PROFILE_PATH", "").strip():
+                cookies = []
+                logger.warning(
+                    f"{username} 本地 profile 模式：未提供 {cookies_key}，以 profile 登录态为准"
+                )
+            else:
+                logger.warning(f"{username} 的任务缺少 {cookies_key} 环境变量，已跳过")
+                continue
+        else:
+            try:
+                cookies = json.loads(cookies_str)
+            except json.JSONDecodeError:
+                logger.warning(f"{username} 的任务 {cookies_key} 格式不正确，已跳过")
+                continue
 
         targets = parse_targets(task.get("targets", []))
 
