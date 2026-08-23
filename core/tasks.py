@@ -426,8 +426,17 @@ def select_target(page, username, target, list_selector, item_selector, search):
 
 
 def read_chat_header_title(page):
-    """尽力读取当前打开会话的标题栏文本，用于发送前二次确认。"""
-    for selector in CHAT_HEADER_TITLE_SELECTORS:
+    """尽力读取当前打开会话的标题栏文本，用于发送前二次确认。
+
+    优先使用配置的 CHAT_HEADER_TITLE_SELECTOR（真实页面核实后填入），
+    否则回退到推断列表。读不到返回 ""，调用方必须据此跳过发送。
+    """
+    selectors = []
+    override = config.get("chatHeaderTitleSelector") or ""
+    if override:
+        selectors.append(override)
+    selectors.extend(CHAT_HEADER_TITLE_SELECTORS)
+    for selector in selectors:
         try:
             loc = page.locator(selector).first
             if loc.count() > 0 and loc.is_visible():
@@ -548,13 +557,11 @@ def do_user_task(browser, username, cookies, targets):
         page.on("response", make_handle_response(userIDDict))
         if owns_context:
             context.add_cookies(cookies)
-        elif cookies:
-            try:
-                context.add_cookies(cookies)
-            except Exception as e:
-                logger.debug(
-                    f"账号 {username} 向 profile 注入 cookies 失败（忽略，走 profile 登录态）: {e}"
-                )
+        else:
+            # profile 模式：登录态以 profile 为准，绝不注入环境变量 Cookie，避免污染 profile
+            logger.debug(
+                f"账号 {username} profile 模式：不使用环境变量 Cookie，登录态以 profile 为准"
+            )
 
         retry_operation(
             "打开抖音网页聊天页面",
@@ -598,15 +605,20 @@ def do_user_task(browser, username, cookies, targets):
                 continue
 
             time.sleep(1)
-            # 发送前二次确认：打开的会话表头必须与目标别名严格等值
+            # 发送前二次确认：表头必须能读到，且与目标别名严格等值，否则一律跳过（宁可漏发）
             header = read_chat_header_title(page)
-            if header:
-                if not strict_title_match(header, target["title_aliases"]):
-                    logger.warning(
-                        f"账号 {username} 表头标题与目标别名不严格匹配，跳过 {target_id!r} (表头 {header!r})"
-                    )
-                    not_found.append(target_id)
-                    continue
+            if not header:
+                logger.warning(
+                    f"账号 {username} 无法读取表头标题，跳过 {target_id!r}（发送前无法确认收件人）"
+                )
+                not_found.append(target_id)
+                continue
+            if not strict_title_match(header, target["title_aliases"]):
+                logger.warning(
+                    f"账号 {username} 表头标题与目标别名不严格匹配，跳过 {target_id!r} (表头 {header!r})"
+                )
+                not_found.append(target_id)
+                continue
 
             try:
                 result, detail = send_chat_message(page, username, target, config)
@@ -649,10 +661,23 @@ def runTasks():
                 f"用户: {user.get('username', '未知用户')}, 目标好友: "
                 f"{[t['id'] for t in user['targets']]}"
             )
+        # profile 模式只能服务一个账号：profile 即该账号的登录态，绝不混用两套 Cookie
+        profile_mode = not hasattr(browser, "new_context")
+        profile_only_id = os.getenv("DOUYIN_PROFILE_UNIQUE_ID", "").strip()
         for user in userData:
             cookies = user["cookies"]
             targets = user["targets"]
             username = user.get("username", "未知用户")
+            unique_id = user.get("unique_id", "")
+            if profile_mode:
+                if not profile_only_id:
+                    logger.warning("profile 模式必须设置 DOUYIN_PROFILE_UNIQUE_ID，本次不执行任何账号")
+                    break
+                if unique_id != profile_only_id:
+                    logger.warning(
+                        f"profile 模式只处理 DOUYIN_PROFILE_UNIQUE_ID={profile_only_id}，跳过账号 {username}"
+                    )
+                    continue
             logger.info(f"开始处理账号 {username}")
             try:
                 do_user_task(browser, username, cookies, targets)
