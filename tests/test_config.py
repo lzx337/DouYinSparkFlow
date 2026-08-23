@@ -132,10 +132,29 @@ class TestGetUserData(unittest.TestCase):
     def tearDown(self):
         os.environ.pop("TASKS", None)
         os.environ.pop("COOKIES_T", None)
+        os.environ.pop("DOUYIN_PROFILE_PATH", None)
+        os.environ.pop("GITHUB_ACTIONS", None)
 
     def test_skips_task_without_cookies(self):
         os.environ["TASKS"] = json.dumps([{"username": "u", "unique_id": "t", "targets": ["A"]}])
-        # 没有 COOKIES_T -> 跳过
+        os.environ.pop("DOUYIN_PROFILE_PATH", None)
+        # 非 profile 模式：没有 COOKIES_T -> 跳过
+        self.assertEqual(get_userData(), [])
+
+    def test_allows_empty_cookies_only_in_local_profile_mode(self):
+        os.environ["TASKS"] = json.dumps([{"username": "u", "unique_id": "t", "targets": ["A"]}])
+        os.environ["GITHUB_ACTIONS"] = ""  # 模拟本地环境
+        os.environ["DOUYIN_PROFILE_PATH"] = r"C:\profile\douyin_2"
+        os.environ.pop("COOKIES_T", None)
+        data = get_userData()
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["cookies"], [])
+
+    def test_skips_missing_cookies_when_profile_path_unset(self):
+        os.environ["TASKS"] = json.dumps([{"username": "u", "unique_id": "t", "targets": ["A"]}])
+        os.environ["GITHUB_ACTIONS"] = ""  # 本地，但没有 DOUYIN_PROFILE_PATH
+        os.environ.pop("DOUYIN_PROFILE_PATH", None)
+        os.environ.pop("COOKIES_T", None)
         self.assertEqual(get_userData(), [])
 
     def test_parses_cookies_and_targets(self):
