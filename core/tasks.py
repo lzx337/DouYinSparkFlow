@@ -189,7 +189,8 @@ def scroll_list_container(page, list_selector, by=800):
     """
     try:
         return page.evaluate(
-            """(sel, by) => {
+            """(args) => {
+                const sel = args.sel, by = args.by;
                 let el = document.querySelector(sel);
                 const candidates = [];
                 while (el && candidates.length < 8) {
@@ -205,8 +206,7 @@ def scroll_list_container(page, list_selector, by=800):
                 return {ok: true, before: before, after: c.scrollTop,
                         sh: c.scrollHeight, ch: c.clientHeight};
             }""",
-            list_selector,
-            by,
+            {"sel": list_selector, "by": by},
         )
     except Exception as e:
         logger.warning(f"账号滚动列表失败: {e}")
