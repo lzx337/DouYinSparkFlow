@@ -47,7 +47,7 @@ def handle_response(response: Response):
 
     try:
         json_data = response.json()
-        for item in json_data.get("data", []):
+        for item in (json_data.get("data") or []):
             short_id = item.get("short_id")
             unique_id = item.get("unique_id")
             sec_uid = item.get("sec_uid", "")
