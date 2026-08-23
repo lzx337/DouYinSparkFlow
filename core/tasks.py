@@ -312,7 +312,12 @@ def select_target(page, username, target, list_selector, item_selector, search):
         # 优先：搜索可能就地过滤会话列表
         el, title = exact_visible_item(page, item_selector, target)
         if el is not None:
-            return True, title
+            try:
+                el.click()
+                return True, title
+            except Exception as e:
+                logger.warning(f"账号 {username} 点击好友 {target} 失败: {e}")
+                return False, None
 
         # 其次：页面上精确文本的可见元素（搜索结果面板等）
         try:
@@ -361,7 +366,8 @@ def send_chat_message(page, username, target):
     if any(k in body_text for k in ("安全验证", "验证码", "短信验证")):
         raise LoginRequired(f"账号 {username} 出现安全验证/登录提示，请人工处理")
 
-    _, chat_input = first_visible_locator(page, CHAT_EDITOR_SELECTORS, timeout=config["browserTimeout"])
+    # 点开会话后输入框应在几秒内出现；等待时间别太长，避免单个目标白等
+    _, chat_input = first_visible_locator(page, CHAT_EDITOR_SELECTORS, timeout=10000)
     if chat_input is None:
         dump_debug_artifacts(page, username, "chat-editor-not-found")
         logger.warning(f"账号 {username} 未找到聊天输入框")
@@ -419,6 +425,9 @@ def do_user_task(browser, username, cookies, targets):
                 not_found.append(target)
                 logger.warning(f"账号 {username} 未找到好友 {target}")
                 continue
+
+            # 点开后等聊天面板渲染，再做发送前二次确认
+            time.sleep(1)
 
             # 发送前二次确认：打开的会话标题与目标完全一致（尽力而为）
             header = read_chat_header_title(page)
