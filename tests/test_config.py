@@ -123,6 +123,32 @@ class TestParseTargets(unittest.TestCase):
         self.assertEqual(out[1]["title_aliases_norm"], ["Liu Beixi"])
 
 
+class TestOutgoingBubbleDefault(unittest.TestCase):
+    """outgoingBubbleSelector 的默认值逻辑（真实 DOM 已核实为 .MessageItemTextisFromMe）。"""
+
+    def setUp(self):
+        utils.config.config = None
+        utils.config.userData = None
+        os.environ.pop("OUTGOING_BUBBLE_SELECTOR", None)
+
+    def tearDown(self):
+        os.environ.pop("OUTGOING_BUBBLE_SELECTOR", None)
+
+    def test_default_when_env_unset(self):
+        # 未设置 -> 用真实 DOM 核实的默认值，保证发送确认开启
+        self.assertEqual(utils.config.get_config()["outgoingBubbleSelector"], ".MessageItemTextisFromMe")
+
+    def test_default_when_env_injected_empty(self):
+        # GitHub Actions 里 var 未设置时会把 env 注入成空串 -> 仍回退默认值（or 语义）
+        os.environ["OUTGOING_BUBBLE_SELECTOR"] = ""
+        self.assertEqual(utils.config.get_config()["outgoingBubbleSelector"], ".MessageItemTextisFromMe")
+
+    def test_explicit_override_wins(self):
+        # 显式配置可覆盖默认（例如抖音改版后新类名）
+        os.environ["OUTGOING_BUBBLE_SELECTOR"] = ".CustomNewBubble"
+        self.assertEqual(utils.config.get_config()["outgoingBubbleSelector"], ".CustomNewBubble")
+
+
 class TestGetUserData(unittest.TestCase):
     def setUp(self):
         # get_userData 有模块级缓存，测试间必须重置
