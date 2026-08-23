@@ -508,14 +508,38 @@ def read_chat_header_title(page, wait_seconds=5):
     return ""
 
 
+def should_skip_duplicate(before_count, before_last_text, norm_msg):
+    """发送前去重（纯逻辑）：最后一条本人文本气泡已是相同内容 -> True（跳过发送）。"""
+    return before_count > 0 and bool(before_last_text) and before_last_text == norm_msg
+
+
+def outgoing_confirm_verdict(norm_msg, before_last_text, last_text):
+    """发送确认决策（纯逻辑）：返回 "sent" / "unverified" / "failed"。
+
+    - last_text == norm_msg 且 发送前最后一条不是相同内容 -> "sent"（新气泡出现且内容匹配）
+    - 发送前最后一条已是相同内容（无法区分新旧）-> "unverified"（绝不宣称成功）
+    - 其他 -> "failed"
+    """
+    if last_text and norm_msg and last_text == norm_msg and before_last_text != norm_msg:
+        return "sent"
+    if before_last_text and before_last_text == norm_msg:
+        return "unverified"
+    return "failed"
+
+
 def send_chat_message(page, username, target, config):
-    """发送前二次确认 -> 输入 -> 发送 -> 本人气泡计数 +1 确认。
+    """发送前二次确认 -> 去重 -> 输入 -> 发送 -> 文字匹配确认。
 
     返回 (状态, 详情)：
-      ("sent", None)            已确认发送成功
+      ("sent", None)            已确认发送成功（最后一条本人气泡内容 == 消息）
       ("unverified", reason)    已尝试发送但无法可靠确认，绝不自动重发
-      ("failed", reason)        明确失败（气泡数未增加 / 失败标记 / 文字不一致）
+      ("failed", reason)        明确失败（相同内容已存在 / 失败标记 / 气泡内容未匹配）
     若检测到安全验证，抛 LoginRequired 安全停止该账号。
+
+    虚拟列表说明：会话消息是虚拟滚动的，DOM 只渲染可视窗口，本人气泡「计数」随滚动
+    窗口漂移，不能用来判断发送成功。因此改为确认「最后一条本人文本气泡的内容 == 消息
+    内容」（发送后新气泡必然出现在窗口底部）。发送前若最后一条已是相同内容，跳过发送
+    避免重复。
     """
     body_text = _body_text(page, 2000)
     if any(k in body_text for k in ("安全验证", "验证码", "短信验证")):
@@ -530,15 +554,34 @@ def send_chat_message(page, username, target, config):
     outgoing_sel = config.get("outgoingBubbleSelector") or ""
     failed_sel = config.get("failedBubbleSelector") or ""
 
-    before = -1
-    if outgoing_sel:
-        try:
-            before = page.locator(outgoing_sel).count()
-        except Exception:
-            before = -1
-            logger.warning(f"账号 {username} 无法读取本人气泡数量（选择器 {outgoing_sel!r}）")
+    # 无法可靠定位本人气泡 -> 不发送（宁漏发）
+    if not outgoing_sel:
+        return "failed", "未配置 outgoingBubbleSelector"
+
+    # 发送前记录最后一条本人文本气泡内容与数量（仅用于去重与辅助判断）
+    before_count = -1
+    before_last_text = ""
+    try:
+        before_count = page.locator(outgoing_sel).count()
+        if before_count > 0:
+            before_last_text = norm(
+                page.locator(outgoing_sel).nth(before_count - 1).inner_text(timeout=2000)
+            )
+    except Exception:
+        logger.warning(f"账号 {username} 无法读取本人气泡（选择器 {outgoing_sel!r}）")
+        before_count = -1
 
     message = build_message()
+    norm_msg = norm(message)
+    if not norm_msg:
+        logger.warning(f"账号 {username} 消息内容为空，跳过发送")
+        return "failed", "消息内容为空"
+
+    # 发送前去重：最后一条本人文本气泡已是相同内容 -> 跳过，绝不重复发
+    if should_skip_duplicate(before_count, before_last_text, norm_msg):
+        logger.warning(f"账号 {username} 最后一条本人消息已是相同内容，跳过发送避免重复")
+        return "failed", "相同内容已存在，跳过避免重复"
+
     lines = message.replace("\\\\n", chr(10)).splitlines() or [message]
     for index, line in enumerate(lines):
         chat_input.type(line)
@@ -548,53 +591,42 @@ def send_chat_message(page, username, target, config):
     chat_input.press("Enter")
     logger.debug(f"账号 {username} 已按下发送")
 
-    # 无法可靠定位本人气泡 -> unverified，不当成功，也不自动重发
-    if not outgoing_sel:
-        return "unverified", "未配置 outgoingBubbleSelector"
-    if before < 0:
-        return "unverified", "无法定位本人气泡"
-
-    count = before
-    last_text = ""
+    # 文字匹配确认：轮询最后一条本人文本气泡 == 消息内容（且 != 发送前最后一条，
+    # 以排除「发送前已是相同内容」的极端场景——那种情况上方已跳过发送，不会到达这里）
     deadline = time.time() + 15
+    last_text = ""
     while time.time() < deadline:
         time.sleep(1)
         try:
-            count = page.locator(outgoing_sel).count()
-            if count > before:
-                try:
-                    last_text = norm(
-                        page.locator(outgoing_sel).nth(before).inner_text(timeout=2000)
-                    )
-                except Exception:
-                    last_text = ""
-                break
+            cnt = page.locator(outgoing_sel).count()
+            if cnt == 0:
+                continue
+            last_text = norm(
+                page.locator(outgoing_sel).nth(cnt - 1).inner_text(timeout=2000)
+            )
+            if last_text == norm_msg and before_last_text != norm_msg:
+                if failed_sel:
+                    try:
+                        last_el = page.locator(outgoing_sel).nth(cnt - 1)
+                        if last_el.locator(failed_sel).count() > 0:
+                            logger.warning(f"账号 {username} 检测到发送失败标记")
+                            return "failed", "失败标记"
+                    except Exception:
+                        pass
+                logger.info(f"账号 {username} 消息发送成功并确认（最后一条本人气泡内容匹配）")
+                return "sent", None
         except Exception:
             continue
-    if count <= before:
-        logger.warning(f"账号 {username} 发送后本人气泡数未增加，判定发送失败")
-        return "failed", "气泡数未增加"
 
-    if failed_sel:
-        try:
-            bubble = page.locator(outgoing_sel).nth(before)
-            if bubble.locator(failed_sel).count() > 0:
-                logger.warning(f"账号 {username} 检测到发送失败标记")
-                return "failed", "失败标记"
-        except Exception:
-            pass
+    verdict = outgoing_confirm_verdict(norm_msg, before_last_text, last_text)
+    if verdict == "unverified":
+        # 理论上不会到这：上方已跳过。若因并发到达，也绝不宣称成功
+        logger.warning(f"账号 {username} 发送前最后一条已是相同内容，无法确认本次新增，返回 unverified")
+        return "unverified", "发送前已有相同内容，无法确认本次新增"
 
-    # 尽力验证最后一条气泡文字与消息一致
-    if last_text:
-        norm_msg = norm(message)
-        if norm_msg and norm_msg not in last_text:
-            logger.warning(
-                f"账号 {username} 气泡文字与消息不一致: {last_text!r} vs {norm_msg!r}"
-            )
-            return "failed", "气泡文字与消息不一致"
-
-    logger.info(f"账号 {username} 消息发送成功并确认（本人气泡数 {before} -> {count}）")
-    return "sent", None
+    dump_debug_artifacts(page, username, "bubble-text-not-matched")
+    logger.warning(f"账号 {username} 发送后未发现本人气泡内容匹配，判定发送失败")
+    return "failed", "气泡内容未匹配"
 
 
 def do_user_task(browser, username, cookies, targets):
