@@ -63,6 +63,9 @@ def get_config():
         "failedBubbleSelector": os.getenv("FAILED_BUBBLE_SELECTOR", ""),
         # 会话表头标题选择器：真实页面核实后填入；不填则用推断列表，读不到表头时宁可跳过也不发送
         "chatHeaderTitleSelector": os.getenv("CHAT_HEADER_TITLE_SELECTOR", ""),
+        # 只读诊断模式：搜索/点击/读表头与列表状态，但发送前停止、不按 Enter（绝不误发）
+        # 用于定位「云端找不到目标」等问题，只输出结构诊断，不记录完整页面内容
+        "dryRun": os.getenv("DRY_RUN", "").strip().lower() in ("1", "true", "yes"),
     }
 
     return config
