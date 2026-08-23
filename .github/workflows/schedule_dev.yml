@@ -41,13 +41,19 @@ jobs:
           TASKS: ${{ vars.TASKS }}
           COOKIES_DYQIJ1ANHNPE: ${{ secrets.COOKIES_DYQIJ1ANHNPE }}
           COOKIES_AONANANIDEGU: ${{ secrets.COOKIES_AONANANIDEGU }}
+          # 发送确认/表头确认的选择器（vars，需在真实登录页核实后配置；缺省则对应功能关闭）
+          OUTGOING_BUBBLE_SELECTOR: ${{ vars.OUTGOING_BUBBLE_SELECTOR }}
+          FAILED_BUBBLE_SELECTOR: ${{ vars.FAILED_BUBBLE_SELECTOR }}
+          CHAT_HEADER_TITLE_SELECTOR: ${{ vars.CHAT_HEADER_TITLE_SELECTOR }}
         run: python main.py
 
-      # 只失败时上传：脱敏文本日志 + 截图（不含完整 HTML / .env / Cookie）
+      # 只失败时上传：脱敏文本日志（.txt） + 截图（.png），不含完整 HTML / .env / Cookie
       - name: Upload debug logs
         if: ${{ failure() }}
         uses: actions/upload-artifact@v4
         with:
           name: run-logs
-          path: logs/
+          path: |
+            logs/**/*.txt
+            logs/**/*.png
           if-no-files-found: ignore
