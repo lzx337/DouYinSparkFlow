@@ -572,32 +572,91 @@ def find_real_scroller(page, timeout_ms=8000):
     return None
 
 
-def select_by_virtual_list(page, username, target, item_selector):
-    """滚动兜底：真实滚动容器 + 鼠标滚轮（贴近真实用户触发虚拟列表加载）。
+def resolve_aliases_with_userdict(target, userIDDict):
+    """目标别名 + userIDDict 动态映射（仅作索引，不依赖它，找不到就原样返回）。
+
+    若 target["id"] 是抖音号（short_id/unique_id），用被动捕获的 user/info 响应把它映射成
+    「当前」备注名/昵称，追加为别名用于匹配。userIDDict 随滚动被动增长，因此本函数应在
+    每次匹配时动态调用（重算 wanted_set），不要只算一次。
+
+    对方改名也不影响：user/info 始终返回该抖音号当前最新标题，old 别名即使失效，
+    新标题仍会命中。返回 (title_aliases, title_aliases_norm)。
+    """
+    aliases = list(target["title_aliases"])
+    aliases_norm = list(target["title_aliases_norm"])
+    tid = target["id"]
+    if not tid:
+        return aliases, aliases_norm
+    for entry in userIDDict.values():
+        # entry = [short_id, unique_id, sec_uid, nickname, remark_name]
+        if tid not in (entry[0], entry[1]):
+            continue
+        for alias in (entry[4], entry[3]):
+            if alias and alias not in aliases:
+                aliases.append(alias)
+                aliases_norm.append(norm(alias))
+    return aliases, aliases_norm
+
+
+def _fallback_list_scroller(page):
+    """云端兜底滚动容器：find_real_scroller 未命中时，直接用列表 wrapper 元素直滚。
+
+    find_real_scroller 要求祖先 computed overflowY 为 auto/scroll；云端虚拟列表的滚动容器
+    overflowY 可能是默认值，导致返回 None（滚动回归：账号1 找不到深层目标）。旧版
+    7d0ac28bfe 直接用 CONVERSATION_LIST_SELECTORS 的 wrapper 做 scrollTop += 800，
+    已验证能加载更多会话。本函数不要求 overflowY，只要求可见的 wrapper 元素。找不到返回 None。
+    """
+    for selector in CONVERSATION_LIST_SELECTORS:
+        try:
+            loc = page.locator(selector)
+            for i in range(min(loc.count(), 12)):
+                wrapper = loc.nth(i)
+                if not wrapper.is_visible():
+                    continue
+                handle = wrapper.element_handle()
+                if handle is not None:
+                    return handle
+        except Exception:
+            continue
+    return None
+
+
+def select_by_virtual_list(page, username, target, item_selector, userIDDict=None):
+    """滚动兜底：真实滚动容器（或 wrapper 兜底）+ scrollTop 直滚。
+
+    滚动机制：优先 find_real_scroller 找到的真实滚动容器；未命中时退回 _fallback_list_scroller
+    （列表 wrapper，旧版 7d0ac28bfe 验证可行）。一律用 scrollTop += 620 直滚，不再依赖
+    mouse.wheel 悬停捕获（云端对悬停目标敏感，回归根源）。
+
+    匹配别名每轮动态重算：unique_id 目标在 userIDDict 被动增长后被映射成「当前」备注名/昵称
+    命中（对方改名也不影响，因为 user/info 始终返回最新标题；匹配桥接在稳定 unique_id 上）。
 
     停止条件（组合判定，缺一不可）：
-    1. 目标任一别名在可见窗口中精确匹配 -> 点击返回（最高优先）
+    1. 目标任一别名（含 userIDDict 动态别名）在可见窗口中精确匹配 -> 点击返回（最高优先）
     2. 连续多轮「可见标题窗口不变 且 已见集合不再增长」-> 判定不可见并停止
-    3. scrollTop 只作为辅助诊断日志，不单独作为停止依据
 
-    find_real_scroller 每次重新扫描候选；找不到滚动容器 -> 只跳过该目标（返回 not_found），
-    继续下一个目标——搜索路径仍可能为其他目标生效。页面级不可用由 wait_for_chat_ready 抛
-    ChatUnavailable 负责（列表根本未渲染时才中止账号）。
+    找不到滚动容器/目标 -> 只跳过该目标（返回 not_found），继续下一个目标，绝不猜测点击。
+    页面级不可用由 wait_for_chat_ready 抛 ChatUnavailable 负责（列表根本未渲染时才中止账号）。
     """
+    userIDDict = userIDDict or {}
     scroller = find_real_scroller(page)
+    if scroller is None:
+        scroller = _fallback_list_scroller(page)
     if scroller is None:
         logger.warning(f"账号 {username} 未找到可滚动容器，滚动兜底跳过目标 {target['id']}")
         return None, None
     try:
-        scroller.hover()  # 悬停在真实滚动区，wheel 事件才可能被虚拟列表捕获
+        scroller.hover()  # 悬停有助于部分虚拟列表加载；scrollTop 直滚不依赖它
     except Exception:
         pass
 
-    wanted_set = set(target["title_aliases_norm"])
     seen = set()
     last_window = tuple()
     stagnant = 0
     for _ in range(120):
+        # 动态别名：userIDDict 随滚动被动增长，unique_id 目标映射成当前备注名/昵称后命中
+        aliases, _ = resolve_aliases_with_userdict(target, userIDDict)
+        wanted_set = set(norm(a) for a in aliases)
         window = visible_titles(page, item_selector)
         seen_before = len(seen)
         seen.update(window)
@@ -608,10 +667,10 @@ def select_by_virtual_list(page, username, target, item_selector):
             return el, title
 
         try:
-            page.mouse.wheel(0, 620)
+            scroller.evaluate("el => el.scrollTop += 620")
         except Exception:
             pass
-        time.sleep(0.35)
+        time.sleep(0.5)
 
         try:
             state = scroller.evaluate(
@@ -639,15 +698,21 @@ def select_by_virtual_list(page, username, target, item_selector):
     return None, None
 
 
-def select_target(page, username, target, item_selector, search):
+def select_target(page, username, target, item_selector, search, userIDDict=None):
     """主路径：搜索框精确筛选；兜底：滚动。找到并点击后返回 (True, title)，否则 (False, None)。
 
     搜索后会话列表被 SearchPanel 覆盖为 hidden，命中项在 .SearchPanelitembox 里；
     点 .SearchPanelitemchat_btn 才会真正进入会话（真实 DOM 验证）。已删除全页 get_by_text 兜底。
     滚动兜底失败只跳过该目标（返回 not_found），不影响其他目标的搜索路径。
+
+    userIDDict 仅作索引：把 unique_id 目标映射成「当前」备注名/昵称参与匹配（动态重算，
+    对方改名也不影响；匹配桥接在稳定 unique_id 上）。搜索框只用于目标显式配置的 search_terms，
+    不把名字写进搜索（名字搜索不稳定，unique_id 目标靠滚动 + 桥接命中）。
     """
-    wanted_set = set(target["title_aliases_norm"])
-    wanted_tight_set = set(norm_tight(a) for a in target["title_aliases"])
+    userIDDict = userIDDict or {}
+    aliases, _ = resolve_aliases_with_userdict(target, userIDDict)
+    wanted_set = set(norm(a) for a in aliases)
+    wanted_tight_set = set(norm_tight(a) for a in aliases)
     if search is not None:
         for term in target["search_terms"]:
             try:
@@ -710,7 +775,7 @@ def select_target(page, username, target, item_selector, search):
                 pass
             time.sleep(0.3)
 
-    el, title = select_by_virtual_list(page, username, target, item_selector)
+    el, title = select_by_virtual_list(page, username, target, item_selector, userIDDict)
     if el is not None:
         try:
             el.click()
@@ -929,7 +994,7 @@ def do_user_task(browser, username, cookies, targets):
             attempted.add(key)
 
             try:
-                found, title = select_target(page, username, target, item_selector, search)
+                found, title = select_target(page, username, target, item_selector, search, userIDDict)
             except LoginRequired:
                 raise
             except ChatUnavailable:
@@ -953,7 +1018,11 @@ def do_user_task(browser, username, cookies, targets):
                 )
                 not_found.append(target_id)
                 continue
-            if not strict_title_match(header, target["title_aliases"]):
+            # 发送前二次确认：用「目标别名 + userIDDict 当前备注/昵称」做严格等值校验，
+            # 表头必须能读到且严格匹配，否则一律跳过（宁可漏发）。对方改名也能过——
+            # 因为 userIDDict 始终返回该抖音号当前最新标题。
+            aliases, _ = resolve_aliases_with_userdict(target, userIDDict)
+            if not strict_title_match(header, aliases):
                 logger.warning(
                     f"账号 {username} 表头标题与目标别名不严格匹配，跳过 {target_id!r} (表头 {header!r})"
                 )
