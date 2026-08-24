@@ -842,12 +842,43 @@ def read_chat_header_title(page, wait_seconds=5):
     return ""
 
 
-def already_present(norm_msg, before_preview, before_last_text):
-    """发送前去重（纯逻辑）：预览或最后一条本人气泡已是相同内容 -> True（跳过发送）。"""
-    if before_preview and visible_compact(before_preview) == visible_compact(norm_msg):
+def _is_today_ts(ts):
+    """会话时间戳是否为「今天」（刚发 / X分钟前 / X小时前 / HH:MM / 含'今天'）。
+
+    '昨天'、'前天'、'MM-DD'、'YYYY-MM-DD' 等非今天标记返回 False。空返回 False。
+    用于「本人今天是否已发过」的判断，避免把昨天发的当重复（续火花要每天发一次）。
+    """
+    if not ts:
+        return False
+    s = str(ts).strip()
+    if not s:
+        return False
+    if "昨天" in s or "前天" in s:
+        return False
+    if "今天" in s or s == "刚刚":
         return True
+    if "分钟前" in s or "小时前" in s:
+        return True
+    # 含横杠/斜杠的是具体日期（非今天）；HH:MM 无日期前缀视为今天
+    if "-" in s or "/" in s:
+        return False
+    if ":" in s:
+        return True
+    return False
+
+
+def already_present(norm_msg, before_ts, before_preview, before_last_text):
+    """发送前去重（纯逻辑）：仅当「本人上一条气泡已是相同内容」且「会话最后消息是今天」-> True。
+
+    关键语义（续火花是每天发一次，旧规则把「列表里任何一条 🔥」当重复，导致发一次后永远
+    不再发、火花必断）：
+    - 本人今天已发过 -> 去重（绝不重复发）
+    - 本人昨天发过 / 对方今天发过 / 对方今天回过 -> 不算重复，今天照发
+    判断依据是「本人气泡 + 会话时间戳是否今天」。预览不再作为去重依据（对方的消息不算我方重复）。
+    时间戳读不到且本人上一条已是相同内容时，保守跳过（宁漏发）。
+    """
     if before_last_text and visible_compact(before_last_text) == visible_compact(norm_msg):
-        return True
+        return _is_today_ts(before_ts) or not before_ts
     return False
 
 
@@ -920,10 +951,10 @@ def send_chat_message(page, username, target, config, item_selector):
     except Exception:
         logger.warning(f"账号 {username} 无法读取本人气泡（选择器 {outgoing_sel!r}）")
 
-    # 发送前去重：预览或最后一条本人气泡已是相同内容 -> 跳过，绝不重复发
-    if already_present(norm_msg, before_preview, before_last_text):
-        logger.warning(f"账号 {username} 目标会话已存在相同内容，跳过发送避免重复")
-        return "failed", "相同内容已存在，跳过避免重复"
+    # 发送前去重：仅当本人今天已发过相同内容 -> 跳过，绝不重复发（昨天发过/对方发的照发）
+    if already_present(norm_msg, before_ts, before_preview, before_last_text):
+        logger.warning(f"账号 {username} 今天已向该会话发送过相同内容，跳过避免重复")
+        return "failed", "今天已发送过相同内容，跳过避免重复"
 
     lines = message.replace("\\\\n", chr(10)).splitlines() or [message]
     for index, line in enumerate(lines):
