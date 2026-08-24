@@ -698,6 +698,33 @@ def select_by_virtual_list(page, username, target, item_selector, userIDDict=Non
     return None, None
 
 
+def _ensure_list_visible(page):
+    """滚动前确保会话列表可见。
+
+    前一个目标的搜索可能留下 SearchPanel 打开，把会话列表置 hidden（wrapper.is_visible()=False，
+    滚动兜底找不到容器）。本函数检测列表是否可见，不可见时按 Esc 关闭残留面板并等待恢复。
+    仅在最坏情况触发，正常路径（列表可见）几乎零开销。
+    """
+    for selector in CONVERSATION_LIST_SELECTORS + CONVERSATION_ITEM_SELECTORS:
+        try:
+            if page.locator(selector).first.is_visible():
+                return
+        except Exception:
+            continue
+    try:
+        page.keyboard.press("Escape")
+        time.sleep(0.8)
+    except Exception:
+        time.sleep(0.3)
+    try:
+        for selector in CONVERSATION_LIST_SELECTORS + CONVERSATION_ITEM_SELECTORS:
+            if page.locator(selector).first.is_visible():
+                return
+    except Exception:
+        pass
+    logger.debug("会话列表未恢复可见，滚动兜底可能仍找不到容器")
+
+
 def select_target(page, username, target, item_selector, search, userIDDict=None):
     """主路径：搜索框精确筛选；兜底：滚动。找到并点击后返回 (True, title)，否则 (False, None)。
 
@@ -713,7 +740,11 @@ def select_target(page, username, target, item_selector, search, userIDDict=None
     aliases, _ = resolve_aliases_with_userdict(target, userIDDict)
     wanted_set = set(norm(a) for a in aliases)
     wanted_tight_set = set(norm_tight(a) for a in aliases)
-    if search is not None:
+    # 纯抖音号目标（search_terms 只有抖音号本身）：搜索框只匹配显示名，搜抖音号只会打开空
+    # SearchPanel 并把会话列表置 hidden，反而破坏滚动兜底。这类目标直接走滚动（旧版
+    # 7d0ac28bfe 行为，已验证能找到深层目标）。
+    id_only = bool(target.get("search_terms")) and set(target["search_terms"]) == {target["id"]}
+    if search is not None and not id_only:
         for term in target["search_terms"]:
             try:
                 search.fill(term)
@@ -775,6 +806,9 @@ def select_target(page, username, target, item_selector, search, userIDDict=None
                 pass
             time.sleep(0.3)
 
+    # 搜索未命中时可能留下 SearchPanel 遮挡列表（列表被置 hidden，滚动兜底找不到容器），
+    # 滚动前先恢复列表可见
+    _ensure_list_visible(page)
     el, title = select_by_virtual_list(page, username, target, item_selector, userIDDict)
     if el is not None:
         try:
