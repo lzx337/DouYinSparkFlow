@@ -650,6 +650,14 @@ def select_by_virtual_list(page, username, target, item_selector, userIDDict=Non
     except Exception:
         pass
 
+    # 会话列表按最近消息排序：前一个目标的点击/发送会改变排序（例如刚发过的会被顶到最上面）。
+    # 因此每次查找前先把列表滚回顶部，从固定起点向下找，避免「目标在当前视口上方」永远扫不到。
+    try:
+        scroller.evaluate("el => el.scrollTop = 0")
+        time.sleep(0.4)
+    except Exception:
+        pass
+
     seen = set()
     last_window = tuple()
     stagnant = 0
@@ -666,6 +674,12 @@ def select_by_virtual_list(page, username, target, item_selector, userIDDict=Non
         if el is not None:
             return el, title
 
+        # 滚动前先等一拍再复查：给 user/info 被动捕获留时间，避免「目标滚进视口但映射还没到」就被滚过头
+        time.sleep(1.0)
+        el, title = exact_visible_item(page, item_selector, wanted_set)
+        if el is not None:
+            return el, title
+
         try:
             scroller.evaluate("el => el.scrollTop += 620")
         except Exception:
@@ -678,9 +692,15 @@ def select_by_virtual_list(page, username, target, item_selector, userIDDict=Non
             )
         except Exception:
             state = None
-        logger.debug(
-            f"账号 {username} 滚动中 scrollTop={state and state.get('top')} "
-            f"可见窗口={len(window)} 累计标题={len(seen)}"
+        has_mapping = False
+        try:
+            tid = target["id"]
+            has_mapping = any(tid in (e[0], e[1]) for e in userIDDict.values())
+        except Exception:
+            pass
+        logger.info(
+            f"账号 {username} 滚动 target={target['id']} 映射={has_mapping} "
+            f"scrollTop={state and state.get('top')} 窗口={len(window)} 累计={len(seen)}"
         )
 
         if window == last_window and not grew:
@@ -689,8 +709,8 @@ def select_by_virtual_list(page, username, target, item_selector, userIDDict=Non
             stagnant = 0
         last_window = window
         if stagnant >= 6:
-            logger.debug(
-                f"账号 {username} 连续 {stagnant} 轮可见窗口无变化且无新标题，判定 {target['id']} 不可见"
+            logger.warning(
+                f"账号 {username} 滚动窗口无变化且无新标题，判定 {target['id']} 不可见（停止）"
             )
             break
 
