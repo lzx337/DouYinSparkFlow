@@ -56,6 +56,9 @@ def get_browser():
             if not headless:
                 launch_kwargs["args"] = ["--start-maximized"]
                 launch_kwargs["no_viewport"] = True
+            else:
+                # 无头静默模式固定桌面视口，与云端一致，降低抖音无头降级渲染概率
+                launch_kwargs["viewport"] = {"width": 1440, "height": 900}
             context = playwright.chromium.launch_persistent_context(
                 profile, **launch_kwargs
             )
