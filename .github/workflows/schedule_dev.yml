@@ -41,6 +41,8 @@ jobs:
           TASKS: ${{ vars.TASKS }}
           COOKIES_DYQIJ1ANHNPE: ${{ secrets.COOKIES_DYQIJ1ANHNPE }}
           COOKIES_AONANANIDEGU: ${{ secrets.COOKIES_AONANANIDEGU }}
+          # 消息内容由 vars.MESSAGE_TEMPLATE 控制（正式只发 🔥，避免误用代码默认模板）
+          MESSAGE_TEMPLATE: ${{ vars.MESSAGE_TEMPLATE }}
           # 发送确认/表头确认的选择器（vars，需在真实登录页核实后配置；缺省则对应功能关闭）
           OUTGOING_BUBBLE_SELECTOR: ${{ vars.OUTGOING_BUBBLE_SELECTOR }}
           FAILED_BUBBLE_SELECTOR: ${{ vars.FAILED_BUBBLE_SELECTOR }}
