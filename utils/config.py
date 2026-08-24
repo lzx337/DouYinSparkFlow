@@ -10,8 +10,9 @@ logger = setup_logger(level=logging.DEBUG)
 """
 是否启用调试模式
 更详细的日志打印，浏览器操作可视化等
+DEBUG 默认 True（本地手动运行可见，便于排查）；计划任务自动运行时设 DEBUG=false 即无头静默
 """
-DEBUG = True
+DEBUG = os.getenv("DEBUG", "true").strip().lower() in ("1", "true", "yes")
 config = None
 userData = None
 
