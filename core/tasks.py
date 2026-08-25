@@ -2,6 +2,7 @@ import os
 import re
 import time
 import traceback
+from datetime import datetime, timedelta, timezone
 
 from playwright.sync_api import Response, TimeoutError as PlaywrightTimeoutError
 
@@ -68,6 +69,13 @@ SEARCH_PANEL_TITLE_SELECTORS = [
 SEARCH_PANEL_CHAT_BTN_SELECTORS = [
     ".SearchPanelitemchat_btn",
     "[class*='SearchPanel'][class*='chat']",
+]
+# 消息面板内每条消息自带的时间戳节点（真实 DOM 实测：DIV.MessageBoxTimetimeLayout，
+# 文本形如 6分钟前 / 10:04 / 昨天 19:58 / 前天）。用于可靠关联「本人气泡」自己的发送时间——
+# 会话列表里的时间是最后一条消息的时间（可能是对方），不能据此判定本人今天是否已发。
+MESSAGE_PANEL_TS_SELECTORS = [
+    ".MessageBoxTimetimeLayout",
+    "[class*='MessageBox'][class*='Time']",
 ]
 
 # 安全验证 / 登录关键词：一旦命中即视为需要人工介入，安全停止该账号
@@ -862,44 +870,103 @@ def read_chat_header_title(page, wait_seconds=5):
     return ""
 
 
-def _is_today_ts(ts):
-    """会话时间戳是否为「今天」（刚发 / X分钟前 / X小时前 / HH:MM / 含'今天'）。
+# 抖音时间/北京时区。GitHub Actions runner 是 UTC，抖音时间戳相对北京时间展示，
+# 不能用 datetime.now()（runner 时区）判定「今天」；中国无夏令时，恒为 UTC+8，
+# 直接写死比 zoneinfo 更省依赖也更可移植（Windows 无 IANA 时区数据库）。
+CN_TZ = timezone(timedelta(hours=8))
 
-    '昨天'、'前天'、'MM-DD'、'YYYY-MM-DD' 等非今天标记返回 False。空返回 False。
-    用于「本人今天是否已发过」的判断，避免把昨天发的当重复（续火花要每天发一次）。
+
+def _date_state(ts, now=None):
+    """三态解析会话/消息面板时间戳：返回 'today' | 'nottoday' | 'unknown'。
+
+    抖音时间戳是相对文本（刚刚 / X分钟前 / X小时前 / HH:MM / 昨天 HH:MM / 昨天 /
+    前天 / X月X日 / YYYY年X月X日 / YYYY-MM-DD / MM-DD）。判定语义：
+    - 跨零点关键修复：'X分钟前/X小时前' 用「北京现在 - 时长」落到哪个自然日判定。
+      北京时间 00:48 看到 '2小时前' -> 昨天 22:48 -> nottoday（旧代码无条件视为今天，
+      导致云端 08-25 00:07 全部误判「今天已发」而漏发，火花必断）。
+    - HH:MM 无日期前缀按今天，但若晚于当前时刻则必是前一天（时间不会来自未来）。
+    - 昨天/前天/具体日期 -> nottoday；刚刚/含「今天」 -> today。
+    - 读不到/无法解析 -> unknown（宁漏发：不能证明是今天就不发）。
+    now 为北京时间的 datetime（naive 或 aware 均可），测试可注入固定时刻。
     """
     if not ts:
-        return False
+        return "unknown"
     s = str(ts).strip()
     if not s:
-        return False
+        return "unknown"
+    now = now or datetime.now(CN_TZ)
+
+    # 相对时间：X分钟前 / X小时前 -> 按北京自然日判定（跨零点）
+    m = re.match(r"^(\d{1,3})\s*分钟前", s)
+    if m:
+        d = now - timedelta(minutes=int(m.group(1)))
+        return "today" if d.date() == now.date() else "nottoday"
+    m = re.match(r"^(\d{1,3})\s*小时前", s)
+    if m:
+        d = now - timedelta(hours=int(m.group(1)))
+        return "today" if d.date() == now.date() else "nottoday"
+
+    if s == "刚刚" or "今天" in s:
+        return "today"
     if "昨天" in s or "前天" in s:
-        return False
-    if "今天" in s or s == "刚刚":
-        return True
-    if "分钟前" in s or "小时前" in s:
-        return True
-    # 含横杠/斜杠的是具体日期（非今天）；HH:MM 无日期前缀视为今天
-    if "-" in s or "/" in s:
-        return False
-    if ":" in s:
-        return True
-    return False
+        return "nottoday"
+
+    # 显式日期：YYYY年M月D日 / YYYY-MM-DD / YYYY/M/D
+    for fmt in ("%Y年%m月%d日", "%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return "today" if datetime.strptime(s, fmt).date() == now.date() else "nottoday"
+        except ValueError:
+            continue
+    # 月-日 无年份：按今年构造（12月30日 对 今天1月2日 -> 非今天，正确）
+    m = re.match(r"^(\d{1,2})月(\d{1,2})日", s)
+    if m:
+        try:
+            d = now.date().replace(month=int(m.group(1)), day=int(m.group(2)))
+            return "today" if d == now.date() else "nottoday"
+        except ValueError:
+            return "unknown"
+    m = re.match(r"^(\d{1,2})[-/](\d{1,2})$", s)
+    if m:
+        try:
+            d = now.date().replace(month=int(m.group(1)), day=int(m.group(2)))
+            return "today" if d == now.date() else "nottoday"
+        except ValueError:
+            return "unknown"
+
+    # HH:MM：无日期前缀视为今天；晚于当前时刻则必为前一天（跨零点）
+    m = re.match(r"^(\d{1,2}):(\d{2})$", s)
+    if m:
+        hh, mm = int(m.group(1)), int(m.group(2))
+        if (hh, mm) > (now.hour, now.minute):
+            return "nottoday"
+        return "today"
+    return "unknown"
 
 
-def already_present(norm_msg, before_ts, before_preview, before_last_text):
-    """发送前去重（纯逻辑）：仅当「本人上一条气泡已是相同内容」且「会话最后消息是今天」-> True。
+def already_present(norm_msg, own_last_text, list_state, own_state):
+    """发送前去重（纯逻辑，三态）：返回 True 表示跳过不发送。
 
-    关键语义（续火花是每天发一次，旧规则把「列表里任何一条 🔥」当重复，导致发一次后永远
-    不再发、火花必断）：
-    - 本人今天已发过 -> 去重（绝不重复发）
-    - 本人昨天发过 / 对方今天发过 / 对方今天回过 -> 不算重复，今天照发
-    判断依据是「本人气泡 + 会话时间戳是否今天」。预览不再作为去重依据（对方的消息不算我方重复）。
-    时间戳读不到且本人上一条已是相同内容时，保守跳过（宁漏发）。
+    续火花每天发一次，只有「本人今天已发过相同内容」才构成重复。新签名把两个时间来源
+    拆开，避免旧逻辑把会话列表时间（最后一条消息时间，可能是对方今天回复）误当成
+    「本人今天已发」的证据：
+    - own_last_text 为空或与将发内容不同 -> 不是重复，返回 False（发送）。
+      注意：own_last_text 相同但 own_state=nottoday（本人昨天发的、对方今天回复）
+      也必须返回 False（发送）——绝不能借对方今天的回复断言本人今天已发。
+    - list_state=nottoday -> 会话最后消息已非今天，本人气泡只可能更早，必非今天，发送。
+      list_state=today 不能单独作为跳过依据（可能是对方今天回复），必须看 own_state。
+    - own_state=today -> 本人今天已发同内容，跳过（去重，绝不重复发）。
+      own_state=nottoday -> 本人昨天发的，今天照发。
+      own_state=unknown -> 无法证明本人气泡属于今天，保守跳过（宁漏发也绝不误发/重复发）。
     """
-    if before_last_text and visible_compact(before_last_text) == visible_compact(norm_msg):
-        return _is_today_ts(before_ts) or not before_ts
-    return False
+    if not own_last_text or visible_compact(own_last_text) != visible_compact(norm_msg):
+        return False
+    if list_state == "nottoday":
+        return False
+    if own_state == "nottoday":
+        return False
+    if own_state == "today":
+        return True
+    return True  # own_state=unknown：不能证明本人今天已发，保守跳过
 
 
 def confirm_signals(norm_msg, before_ts, before_preview, now_ts, now_preview, bubble_text):
@@ -918,6 +985,49 @@ def confirm_signals(norm_msg, before_ts, before_preview, now_ts, now_preview, bu
     if bubble_text and visible_compact(bubble_text) == visible_compact(norm_msg):
         return True
     return False
+
+
+LAST_OUTGOING_TS_JS = r"""
+(el, sel) => {
+  // 取本人气泡关联的时间戳：DOM 中位于该气泡之前、距它最近的 MessageBoxTimetimeLayout。
+  // 面板最新消息在 DOM 末尾、时间戳节点随消息展开，最近的前置时间节点即该气泡自己的时间。
+  let prev = '';
+  try {
+    const nodes = Array.from(document.querySelectorAll(sel));
+    for (const t of nodes) {
+      if (t.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING) {
+        prev = (t.textContent || '').trim();
+      }
+    }
+  } catch (e) { return ''; }
+  return prev;
+}
+"""
+
+
+def read_last_outgoing_date(page, outgoing_sel):
+    """读最后一条本人气泡关联的时间戳文本，用于可靠判定「本人今天是否已发」。
+
+    只读时间文本（6分钟前 / 10:04 / 昨天 19:58 ...），绝不读消息正文。返回 (state, raw_ts)：
+    - 面板没有本人气泡 / 选择器失效 / JS 读不到 -> ("unknown", "")（宁漏发）；
+    - 时间文本再交给 _date_state 做三态判定。
+    注意与 read_conversation_item_state 的区别：列表时间是「会话最后一条消息」的时间，
+    可能是对方今天回复；这里取的是本人气泡自己的时间戳（最近的前置时间节点）。
+    """
+    try:
+        cnt = page.locator(outgoing_sel).count()
+        if cnt == 0:
+            return "unknown", ""
+        last = page.locator(outgoing_sel).nth(cnt - 1)
+        if not last.is_visible():
+            # 气泡不在可视区（虚拟列表未渲染）读不到可靠时间，宁漏发
+            return "unknown", ""
+        raw = (last.evaluate(LAST_OUTGOING_TS_JS, ",".join(MESSAGE_PANEL_TS_SELECTORS)) or "").strip()
+        if not raw:
+            return "unknown", ""
+        return _date_state(raw), raw
+    except Exception:
+        return "unknown", ""
 
 
 def send_chat_message(page, username, target, config, item_selector):
@@ -956,25 +1066,40 @@ def send_chat_message(page, username, target, config, item_selector):
         logger.warning(f"账号 {username} 消息内容为空，跳过发送")
         return "failed", "消息内容为空"
 
-    # 发送前读取目标会话项状态（时间戳 + 预览），作为去重与确认基准
+    # 发送前读取目标会话项状态（列表时间戳 + 预览）。列表时间是「会话最后一条消息」的时间，
+    # 可能是对方今天回复——绝不能据此认定「本人今天已发」（这正是旧 bug 的根因）。它只
+    # 用于「明确非今天 -> 照发」这一个保守方向。
     wanted_set = set(target["title_aliases_norm"])
     before_ts, before_preview, _ = read_conversation_item_state(
         page, item_selector, wanted_set
     )
-    before_last_text = ""
+    list_state = _date_state(before_ts) if before_ts else "unknown"
+
+    # 本人上一条气泡文本 + 它在消息面板内自己的时间戳（可靠关联），真正用于判定
+    # 「本人今天是否已发过相同内容」。
+    own_last_text = ""
     try:
         cnt = page.locator(outgoing_sel).count()
         if cnt > 0:
-            before_last_text = norm(
+            own_last_text = norm(
                 page.locator(outgoing_sel).nth(cnt - 1).inner_text(timeout=2000)
             )
     except Exception:
         logger.warning(f"账号 {username} 无法读取本人气泡（选择器 {outgoing_sel!r}）")
+    own_state, own_raw_ts = read_last_outgoing_date(page, outgoing_sel)
 
-    # 发送前去重：仅当本人今天已发过相同内容 -> 跳过，绝不重复发（昨天发过/对方发的照发）
-    if already_present(norm_msg, before_ts, before_preview, before_last_text):
+    # 三态去重：只有「本人今天已发过同内容」才跳过；无法证明本人气泡属于今天的也保守
+    # 跳过（宁漏发也绝不重复发）。返回两种分类：dedup_skip（确定重复）/ uncertain_skip
+    # （时间不足以证明，保守跳过），供任务级汇总与可观测性区分。
+    if already_present(norm_msg, own_last_text, list_state, own_state):
+        if own_state == "unknown":
+            logger.warning(
+                f"账号 {username} 无法证明本人气泡属于今天"
+                f"（列表时间 {before_ts!r} / 本人气泡时间 {own_raw_ts!r}），保守跳过避免重复"
+            )
+            return "uncertain_skip", "无法证明本人气泡属于今天，保守跳过"
         logger.warning(f"账号 {username} 今天已向该会话发送过相同内容，跳过避免重复")
-        return "failed", "今天已发送过相同内容，跳过避免重复"
+        return "dedup_skip", "今天已发送过相同内容，跳过避免重复"
 
     lines = message.replace("\\\\n", chr(10)).splitlines() or [message]
     for index, line in enumerate(lines):
@@ -1068,6 +1193,9 @@ def do_user_task(browser, username, cookies, targets):
 
         not_found = []
         unverified = []
+        sent = []
+        dedup_skip = []
+        uncertain_skip = []
         dry_matched = []
         attempted = set()  # 当次运行内 at-most-once：同一 账号+目标 只尝试一次，绝不自动重发
         for target in targets:
@@ -1127,12 +1255,19 @@ def do_user_task(browser, username, cookies, targets):
             try:
                 result, detail = send_chat_message(page, username, target, config, item_selector)
                 if result == "sent":
+                    sent.append(target_id)
                     logger.info(f"账号 {username} 已向 {target_id} 发送并确认")
                 elif result == "unverified":
                     unverified.append(target_id)
                     logger.warning(
                         f"账号 {username} 向 {target_id} 发送但无法确认 (unverified): {detail}"
                     )
+                elif result == "dedup_skip":
+                    dedup_skip.append(target_id)
+                    logger.warning(f"账号 {username} 去重跳过（本人今天已发同内容）: {detail}")
+                elif result == "uncertain_skip":
+                    uncertain_skip.append(target_id)
+                    logger.warning(f"账号 {username} 时间不确定保守跳过（宁漏发）: {detail}")
                 else:
                     not_found.append(target_id)
                     logger.warning(f"账号 {username} 向 {target_id} 发送失败: {detail}")
@@ -1147,9 +1282,25 @@ def do_user_task(browser, username, cookies, targets):
             logger.warning(f"账号 {username} 本次未找到/未发送好友: {not_found}")
         if unverified:
             logger.warning(f"账号 {username} 发送但未确认的好友: {unverified}")
+        if dedup_skip:
+            logger.warning(f"账号 {username} 去重跳过（本人今天已发同内容）: {dedup_skip}")
+        if uncertain_skip:
+            logger.warning(f"账号 {username} 时间不确定保守跳过（宁漏发）: {uncertain_skip}")
         if dry_matched:
             logger.info(f"账号 {username} [DRY_RUN] 表头严格匹配通过但不发送: {dry_matched}")
-        logger.debug(f"账号 {username} 任务完成")
+        logger.info(
+            f"账号 {username} 任务完成：已发送并确认 {len(sent)}，"
+            f"未找到 {len(not_found)}，未确认 {len(unverified)}，"
+            f"去重跳过 {len(dedup_skip)}，时间不确定跳过 {len(uncertain_skip)}"
+        )
+        return {
+            "sent": len(sent),
+            "not_found": not_found,
+            "unverified": unverified,
+            "dedup_skip": dedup_skip,
+            "uncertain_skip": uncertain_skip,
+            "dry_matched": dry_matched,
+        }
     finally:
         if owns_context:
             context.close()
@@ -1157,6 +1308,7 @@ def do_user_task(browser, username, cookies, targets):
 
 def runTasks():
     playwright, browser = get_browser()
+    failed = False  # 任一账号存在待处理项/异常 -> 非 0 退出，让 CI 步骤失败以便上传承诺的制品
     try:
         logger.info("开始执行任务")
         logger.debug("当前配置如下：")
@@ -1186,14 +1338,37 @@ def runTasks():
                     continue
             logger.info(f"开始处理账号 {username}")
             try:
-                do_user_task(browser, username, cookies, targets)
-                logger.info(f"账号 {username} 任务完成")
+                summary = do_user_task(browser, username, cookies, targets)
+                problems = (
+                    len(summary["not_found"])
+                    + len(summary["unverified"])
+                    + len(summary["dedup_skip"])
+                    + len(summary["uncertain_skip"])
+                )
+                if problems:
+                    failed = True
+                    logger.warning(
+                        f"账号 {username} 存在 {problems} 个待处理项"
+                        f"（未找到 {len(summary['not_found'])} / 未确认 {len(summary['unverified'])} / "
+                        f"去重跳过 {len(summary['dedup_skip'])} / "
+                        f"时间不确定跳过 {len(summary['uncertain_skip'])}），本次任务将非 0 退出"
+                    )
             except LoginRequired as e:
+                failed = True
                 logger.warning(f"账号 {username} 中止: {e}")
             except ChatUnavailable as e:
+                failed = True
                 logger.warning(f"账号 {username} 中止: {e}")
             except Exception as e:
+                failed = True
                 logger.error(f"账号 {username} 异常: {e}\n{traceback.format_exc()}")
     finally:
         browser.close()
         playwright.stop()
+    if failed:
+        logger.warning(
+            "存在未发送/未确认/时间不确定跳过或账号级异常，本次任务以非 0 退出（可观测性）"
+        )
+        return 1
+    logger.info("全部账号任务完成，无待处理项")
+    return 0

@@ -7,4 +7,6 @@ if os.path.exists(".env"):
 
 from core.tasks import runTasks
 
-runTasks()
+# 退出码：0=全部完成无待处理；非 0=存在未发送/未确认/时间不确定跳过或账号异常，
+# 让 CI 步骤失败并触发 failure() 制品上传，保证可观测性。
+raise SystemExit(runTasks())
