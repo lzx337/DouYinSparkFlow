@@ -1,16 +1,19 @@
 # -*- coding: utf-8 -*-
 """core/tasks.py 发送确认 / 发送前去重决策逻辑（纯函数）的单元测试。
 
-覆盖「宁可漏发也绝不误发/重复发」在跨零点、表情码、换行混排下的决策：
-- _date_state：三态时间判定（today / nottoday / unknown），北京时区跨零点正确
-- visible_compact：去表情码 + 去字面转义 + 去空白，跨渲染差异可对比
-- already_present：新签名四参（本人气泡文本 / 列表时间状态 / 本人气泡时间状态）
-- confirm_signals：多信号确认（预览匹配 / 时间戳翻转「刚刚」/ 气泡匹配），全不命中 -> False
+覆盖「宁可漏发也绝不误发/重复发」在跨零点、证据冲突、读取失败、表情码、换行混排下的决策：
+- _date_state：三态时间判定（today / nottoday / unknown）。'X分钟前/X小时前' 是相对时间
+  非精确值，按向下取整区间 [n, n+1) 保守判定：整体今天=today、整体前一天=nottoday、
+  跨日边界=unknown（宁漏发，绝不把边界误判成「今天」而漏发，也不放行重发）。
+- visible_compact：去表情码 + 去字面转义 + 去空白，跨渲染差异可对比。
+- already_present：返回 'send' | 'dedup_skip' | 'uncertain_skip'。只有「本人今天已发过
+  相同内容」才构成重复；本人时间今天无条件跳过（即使列表时间自相矛盾）；本人气泡读取
+  失败必须 uncertain_skip（无法排除已发）；列表时间只用于「明确非今天 -> 放行」。
+- confirm_signals：多信号确认（预览匹配 / 时间戳翻转「刚刚」/ 气泡匹配），全不命中 -> False。
 
-跨零点核心语义（旧 bug 修复）：北京时间 00:07 的云端运行看到会话列表「2小时前」，
-那是前一天 22:07 本人发的 🔥，不是今天——绝不能据此跳过。列表时间是「会话最后一条
-消息」的时间（可能是对方今天回复），判定「本人今天是否已发」必须看本人气泡自己的
-时间戳状态（own_state）。
+跨零点核心语义：北京时间 00:07 的云端运行看到会话列表「2小时前」= 前一天本人发的 🔥，
+不是今天——绝不能据此跳过。列表时间是「会话最后一条消息」的时间（可能是对方今天回复），
+判定「本人今天是否已发」必须看本人气泡自己的时间戳状态（own_state）。
 """
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -31,39 +34,45 @@ class TestDateState(unittest.TestCase):
     """_date_state 三态判定：00:48 看到 '2小时前' 必须是非今天（旧 bug 根因）。"""
 
     def test_0048_two_hours_ago_is_nottoday(self):
-        # 云端实测场景：北京时间 08-25 00:48 列表显示「2小时前」= 08-24 22:48
+        # 云端实测场景：北京时间 08-25 00:48 列表显示「2小时前」。floor 区间 [21:48, 22:48)
+        # 整体在 08-24 -> nottoday（旧代码无条件视为今天导致漏发，火花必断）。
         self.assertEqual(_date_state("2小时前", BJ(2026, 8, 25, 0, 48)), "nottoday")
 
     def test_0048_one_hour_ago_is_nottoday(self):
+        # floor 区间 [22:48, 23:48) 整体在 08-24
         self.assertEqual(_date_state("1小时前", BJ(2026, 8, 25, 0, 48)), "nottoday")
 
     def test_0048_ten_min_ago_is_today(self):
-        # 00:38 仍属今天
+        # floor 区间 [00:37, 00:38] 整体今天
         self.assertEqual(_date_state("10分钟前", BJ(2026, 8, 25, 0, 48)), "today")
 
-    def test_0048_forty_eight_min_ago_boundary_is_today(self):
-        # 恰好 00:00（自然日分界点仍算今天）
-        self.assertEqual(_date_state("48分钟前", BJ(2026, 8, 25, 0, 48)), "today")
+    def test_0048_forty_eight_min_ago_span_is_unknown(self):
+        # 「48分钟前」floor 区间 [23:59, 00:00] 跨日边界，相对时间不精确无法可靠判定 -> unknown
+        self.assertEqual(_date_state("48分钟前", BJ(2026, 8, 25, 0, 48)), "unknown")
 
     def test_0048_forty_nine_min_ago_is_nottoday(self):
-        # 49 分钟前 = 23:59（前一天）-> 非今天
+        # floor 区间 [23:58, 23:59] 整体前一天
         self.assertEqual(_date_state("49分钟前", BJ(2026, 8, 25, 0, 48)), "nottoday")
 
-    def test_0005_five_min_ago_is_today(self):
-        # 00:00 发出，00:05 看到「5分钟前」仍是今天
-        self.assertEqual(_date_state("5分钟前", BJ(2026, 8, 25, 0, 5)), "today")
+    def test_0005_five_min_ago_span_is_unknown(self):
+        # 00:05 见「5分钟前」floor 区间 [23:59, 00:00] 跨日边界 -> unknown（宁漏发）
+        self.assertEqual(_date_state("5分钟前", BJ(2026, 8, 25, 0, 5)), "unknown")
+
+    def test_0200_one_hour_ago_whole_bucket_today(self):
+        # 02:00 见「1小时前」floor 区间 [00:00, 01:00] 整体今天
+        self.assertEqual(_date_state("1小时前", BJ(2026, 8, 25, 2, 0)), "today")
 
     def test_2300_hours_before_midnight_still_today(self):
-        # 23:00 看到「1小时前」= 22:00 今天；「2小时前」= 21:00 今天
+        # 23:00 见「1小时前」= [21:00,22:00) 今天；「2小时前」= [20:00,21:00) 今天
         self.assertEqual(_date_state("1小时前", BJ(2026, 8, 25, 23, 0)), "today")
         self.assertEqual(_date_state("2小时前", BJ(2026, 8, 25, 23, 0)), "today")
 
     def test_0030_next_day_one_hour_ago_is_nottoday(self):
-        # 新一天 00:30 看到「1小时前」= 前一天 23:30
+        # 新一天 00:30 见「1小时前」floor 区间 [22:30, 23:30) 整体前一天
         self.assertEqual(_date_state("1小时前", BJ(2026, 8, 26, 0, 30)), "nottoday")
 
     def test_hhmm_after_now_is_nottoday(self):
-        # HH:MM 晚于当前时刻必是前一天（时间不会来自未来）
+        # HH:MM 是精确展示，晚于当前时刻必是前一天（时间不会来自未来）
         self.assertEqual(_date_state("10:04", BJ(2026, 8, 25, 0, 48)), "nottoday")
         self.assertEqual(_date_state("00:59", BJ(2026, 8, 25, 0, 48)), "nottoday")
 
@@ -115,67 +124,87 @@ class TestVisibleCompact(unittest.TestCase):
 
 
 class TestAlreadyPresent(unittest.TestCase):
-    """新签名 already_present(norm_msg, own_last_text, list_state, own_state)。
+    """already_present(norm_msg, own_last_text, own_read_ok, list_state, own_state)
+    -> 'send' | 'dedup_skip' | 'uncertain_skip'。
 
-    核心：只有「本人今天已发过相同内容」才跳过；会话列表今天（可能是对方今天回复）
-    绝不等于本人今天已发；本人气泡时间读不到 -> 保守跳过（宁漏发）。
+    核心：只有「本人今天已发过相同内容」才跳过；本人时间今天无条件跳过（列表自相矛盾也
+    不放行）；本人气泡读取失败必须保守跳过（无法排除已发）；列表今天绝不等于本人今天已发。
     """
 
     def test_own_yesterday_partner_replied_today_must_send(self):
-        # 要求#3：本人昨天发🔥、对方今天回复 -> 列表时间 today 不能当「本人今天已发」。
-        # 本人气泡时间不是今天 -> 必须返回 False（发送），火花才能续上。
-        self.assertFalse(
-            already_present("今日火花", "今日火花", "today", "nottoday")
+        # 本人昨天发🔥、对方今天回复 -> 列表时间 today 不能当「本人今天已发」。
+        # 本人气泡时间不是今天 -> 必须 send，火花才能续上。
+        self.assertEqual(
+            already_present("今日火花", "今日火花", True, "today", "nottoday"), "send"
         )
-        self.assertFalse(
-            already_present("今日火花", "今日火花", "unknown", "nottoday")
+        self.assertEqual(
+            already_present("今日火花", "今日火花", True, "unknown", "nottoday"), "send"
         )
 
     def test_own_same_content_today_must_skip(self):
-        # 要求#4：本人今天已发过同内容 -> 跳过，绝不重复发
-        self.assertTrue(
-            already_present("今日火花", "今日火花", "today", "today")
+        # 本人今天已发过同内容 -> dedup_skip，绝不重复发
+        self.assertEqual(
+            already_present("今日火花", "今日火花", True, "today", "today"), "dedup_skip"
         )
-        self.assertTrue(
-            already_present("今日火花", "今日火花", "unknown", "today")
-        )
-
-    def test_unreadable_own_date_must_skip(self):
-        # 要求#5：本人气泡时间读不到/无法解析 -> 不能证明属于今天，保守跳过
-        self.assertTrue(
-            already_present("今日火花", "今日火花", "today", "unknown")
-        )
-        self.assertTrue(
-            already_present("今日火花", "今日火花", "unknown", "unknown")
+        self.assertEqual(
+            already_present("今日火花", "今日火花", True, "unknown", "today"), "dedup_skip"
         )
 
-    def test_list_nottoday_short_circuits_send(self):
-        # 会话最后消息明确非今天 -> 本人气泡只可能更早，今天照发（即使 own_state 读不到）
-        self.assertFalse(
-            already_present("今日火花", "今日火花", "nottoday", "today")
+    def test_own_today_list_nottoday_conflict_is_uncertain(self):
+        # 证据冲突：本人气泡今天 但 列表非今天，无法可靠判定 -> uncertain_skip，
+        # 绝不因列表矛盾就放行发送（这是审查发现的放行漏洞，测试固化其关闭）
+        self.assertEqual(
+            already_present("今日火花", "今日火花", True, "nottoday", "today"),
+            "uncertain_skip",
         )
-        self.assertFalse(
-            already_present("今日火花", "今日火花", "nottoday", "unknown")
+
+    def test_own_unknown_list_today_is_uncertain(self):
+        # 本人气泡时间读不到 + 列表今天 -> 无法证明本人今天已发，保守跳过
+        self.assertEqual(
+            already_present("今日火花", "今日火花", True, "today", "unknown"),
+            "uncertain_skip",
+        )
+        self.assertEqual(
+            already_present("今日火花", "今日火花", True, "unknown", "unknown"),
+            "uncertain_skip",
+        )
+
+    def test_own_unknown_list_nottoday_sends(self):
+        # 本人气泡时间读不到 + 列表明确非今天 -> 本人气泡（属本会话）只可能更早，send
+        self.assertEqual(
+            already_present("今日火花", "今日火花", True, "nottoday", "unknown"), "send"
+        )
+
+    def test_empty_own_last_text_confirmed_no_bubble_sends(self):
+        # 确认读取成功（own_read_ok=True）且面板无本人气泡 -> 非重复，send
+        self.assertEqual(
+            already_present("今日火花", "", True, "today", "today"), "send"
+        )
+
+    def test_empty_own_last_text_read_failed_is_uncertain(self):
+        # 读取失败（own_read_ok=False）无法排除已发同内容 -> 必须 uncertain_skip，
+        # 即使列表时间/本人时间都显示非今天（读取失败优先于一切放行证据）
+        self.assertEqual(
+            already_present("今日火花", "", False, "today", "today"), "uncertain_skip"
+        )
+        self.assertEqual(
+            already_present("今日火花", "", False, "nottoday", "nottoday"), "uncertain_skip"
         )
 
     def test_different_content_sends(self):
-        self.assertFalse(
-            already_present("今日火花", "其他消息", "today", "today")
-        )
-
-    def test_empty_own_last_text_sends(self):
-        # 读不到本人气泡文本 -> 无从证明重复，发送（宁漏发：不证明是重复就不跳过）
-        self.assertFalse(
-            already_present("今日火花", "", "today", "today")
+        self.assertEqual(
+            already_present("今日火花", "其他消息", True, "today", "today"), "send"
         )
 
     def test_content_equality_after_emoji_strip(self):
         # 表情码渲染差异经 visible_compact 归一后可正确对比
-        self.assertTrue(
-            already_present("今日火花", "[盖瑞]今日火花[加一]", "today", "today")
+        self.assertEqual(
+            already_present("今日火花", "[盖瑞]今日火花[加一]", True, "today", "today"),
+            "dedup_skip",
         )
-        self.assertFalse(
-            already_present("今日火花", "[盖瑞]今日火花[加一]", "today", "nottoday")
+        self.assertEqual(
+            already_present("今日火花", "[盖瑞]今日火花[加一]", True, "today", "nottoday"),
+            "send",
         )
 
 
