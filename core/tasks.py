@@ -876,15 +876,29 @@ def read_chat_header_title(page, wait_seconds=5):
 CN_TZ = timezone(timedelta(hours=8))
 
 
+def _bucket_date_state(earliest, latest, now):
+    """相对时间区间 [earliest, latest] 落在哪个自然日。
+
+    返回 'today'（区间整体今天）/'nottoday'（区间整体前一天）/'unknown'（跨日边界，
+    相对时间不精确，无法可靠判定自然日——宁漏发）。
+    """
+    if earliest.date() == now.date() and latest.date() == now.date():
+        return "today"
+    if earliest.date() != now.date() and latest.date() != now.date():
+        return "nottoday"
+    return "unknown"
+
+
 def _date_state(ts, now=None):
     """三态解析会话/消息面板时间戳：返回 'today' | 'nottoday' | 'unknown'。
 
     抖音时间戳是相对文本（刚刚 / X分钟前 / X小时前 / HH:MM / 昨天 HH:MM / 昨天 /
     前天 / X月X日 / YYYY年X月X日 / YYYY-MM-DD / MM-DD）。判定语义：
-    - 跨零点关键修复：'X分钟前/X小时前' 用「北京现在 - 时长」落到哪个自然日判定。
-      北京时间 00:48 看到 '2小时前' -> 昨天 22:48 -> nottoday（旧代码无条件视为今天，
-      导致云端 08-25 00:07 全部误判「今天已发」而漏发，火花必断）。
-    - HH:MM 无日期前缀按今天，但若晚于当前时刻则必是前一天（时间不会来自未来）。
+    - 跨零点关键修复：'X分钟前/X小时前' 不是精确值，按向下取整区间 [n, n+1) 保守判定
+      自然日（区间整体今天=today / 整体前一天=nottoday / 跨日边界=unknown）。核心场景
+      不变：北京时间 00:48 见 '2小时前' 区间 [21:48, 22:48) 整体在 08-24 -> nottoday
+      （旧代码无条件视为今天，导致云端 08-25 00:07 全部误判「今天已发」而漏发，火花必断）。
+    - HH:MM 是精确展示：无日期前缀按今天，但若晚于当前时刻则必是前一天（时间不会来自未来）。
     - 昨天/前天/具体日期 -> nottoday；刚刚/含「今天」 -> today。
     - 读不到/无法解析 -> unknown（宁漏发：不能证明是今天就不发）。
     now 为北京时间的 datetime（naive 或 aware 均可），测试可注入固定时刻。
@@ -896,15 +910,20 @@ def _date_state(ts, now=None):
         return "unknown"
     now = now or datetime.now(CN_TZ)
 
-    # 相对时间：X分钟前 / X小时前 -> 按北京自然日判定（跨零点）
+    # 相对时间：X分钟前 / X小时前。抖音标签按 floor 展示但未核实精确语义，跨日边界
+    # 无法可靠判定自然日 -> unknown（绝不把边界误判成「今天」而漏发，也不放行重发）。
     m = re.match(r"^(\d{1,3})\s*分钟前", s)
     if m:
-        d = now - timedelta(minutes=int(m.group(1)))
-        return "today" if d.date() == now.date() else "nottoday"
+        n = int(m.group(1))
+        return _bucket_date_state(
+            now - timedelta(minutes=n + 1), now - timedelta(minutes=n), now
+        )
     m = re.match(r"^(\d{1,3})\s*小时前", s)
     if m:
-        d = now - timedelta(hours=int(m.group(1)))
-        return "today" if d.date() == now.date() else "nottoday"
+        n = int(m.group(1))
+        return _bucket_date_state(
+            now - timedelta(hours=n + 1), now - timedelta(hours=n), now
+        )
 
     if s == "刚刚" or "今天" in s:
         return "today"
@@ -943,30 +962,38 @@ def _date_state(ts, now=None):
     return "unknown"
 
 
-def already_present(norm_msg, own_last_text, list_state, own_state):
-    """发送前去重（纯逻辑，三态）：返回 True 表示跳过不发送。
+def already_present(norm_msg, own_last_text, own_read_ok, list_state, own_state):
+    """发送前去重（纯逻辑）：返回 'send' | 'dedup_skip' | 'uncertain_skip'。
 
-    续火花每天发一次，只有「本人今天已发过相同内容」才构成重复。新签名把两个时间来源
-    拆开，避免旧逻辑把会话列表时间（最后一条消息时间，可能是对方今天回复）误当成
-    「本人今天已发」的证据：
-    - own_last_text 为空或与将发内容不同 -> 不是重复，返回 False（发送）。
-      注意：own_last_text 相同但 own_state=nottoday（本人昨天发的、对方今天回复）
-      也必须返回 False（发送）——绝不能借对方今天的回复断言本人今天已发。
-    - list_state=nottoday -> 会话最后消息已非今天，本人气泡只可能更早，必非今天，发送。
-      list_state=today 不能单独作为跳过依据（可能是对方今天回复），必须看 own_state。
-    - own_state=today -> 本人今天已发同内容，跳过（去重，绝不重复发）。
-      own_state=nottoday -> 本人昨天发的，今天照发。
-      own_state=unknown -> 无法证明本人气泡属于今天，保守跳过（宁漏发也绝不误发/重复发）。
+    续火花每天发一次，只有「本人今天已发过相同内容」才构成重复；绝不重复发优先于一切：
+    - own_last_text 与将发内容不同 -> 不是重复，send。
+    - own_last_text 为空：仅当确认读取成功（own_read_ok=True，面板确实无本人气泡）才 send；
+      读取失败/未渲染（own_read_ok=False）无法排除已发同内容 -> uncertain_skip（宁漏发）。
+    - 同内容且 own_state=today -> 本人今天已发，dedup_skip（无条件；即使 list_state 显示
+      非今天自相矛盾也不能放行）。
+    - 同内容且 own_state=today 但 list_state=nottoday -> 证据冲突（本人今天 vs 列表非今天），
+      无法可靠判定 -> uncertain_skip（绝不因列表矛盾就放行发送）。
+    - 同内容且 own_state=nottoday -> 本人昨天发的（对方今天回复很正常），今天照发，send。
+    - 同内容且 own_state=unknown：list_state=nottoday -> 本人气泡（属本会话）只可能更早，send；
+      否则无法证明本人今天已发 -> uncertain_skip。
+    列表时间（list_state）只用于「明确非今天 -> 放行」的保守方向，绝不单独判定「已发」。
     """
-    if not own_last_text or visible_compact(own_last_text) != visible_compact(norm_msg):
-        return False
-    if list_state == "nottoday":
-        return False
-    if own_state == "nottoday":
-        return False
+    if own_last_text and visible_compact(own_last_text) != visible_compact(norm_msg):
+        return "send"
+    if not own_last_text:
+        if not own_read_ok:
+            return "uncertain_skip"  # 读取失败：无法排除已发同内容
+        return "send"  # 确认面板无本人气泡，非重复
     if own_state == "today":
-        return True
-    return True  # own_state=unknown：不能证明本人今天已发，保守跳过
+        if list_state == "nottoday":
+            return "uncertain_skip"  # 本人今天 vs 列表非今天，证据冲突
+        return "dedup_skip"
+    if own_state == "nottoday":
+        return "send"
+    # own_state == "unknown"
+    if list_state == "nottoday":
+        return "send"
+    return "uncertain_skip"
 
 
 def confirm_signals(norm_msg, before_ts, before_preview, now_ts, now_preview, bubble_text):
@@ -1076,30 +1103,41 @@ def send_chat_message(page, username, target, config, item_selector):
     list_state = _date_state(before_ts) if before_ts else "unknown"
 
     # 本人上一条气泡文本 + 它在消息面板内自己的时间戳（可靠关联），真正用于判定
-    # 「本人今天是否已发过相同内容」。
+    # 「本人今天是否已发过相同内容」。气泡文本读取必须区分「确认无本人气泡」与「读取
+    # 失败」：读取失败/未渲染时无法排除已发同内容，绝不能当「没发过」放行（宁漏发）。
     own_last_text = ""
+    own_read_ok = True
     try:
         cnt = page.locator(outgoing_sel).count()
         if cnt > 0:
             own_last_text = norm(
                 page.locator(outgoing_sel).nth(cnt - 1).inner_text(timeout=2000)
             )
+        # cnt == 0 -> 面板确实无本人气泡，own_read_ok 保持 True
     except Exception:
-        logger.warning(f"账号 {username} 无法读取本人气泡（选择器 {outgoing_sel!r}）")
+        own_read_ok = False
+        logger.warning(f"账号 {username} 无法读取本人气泡（选择器 {outgoing_sel!r}），保守判定")
     own_state, own_raw_ts = read_last_outgoing_date(page, outgoing_sel)
 
-    # 三态去重：只有「本人今天已发过同内容」才跳过；无法证明本人气泡属于今天的也保守
-    # 跳过（宁漏发也绝不重复发）。返回两种分类：dedup_skip（确定重复）/ uncertain_skip
-    # （时间不足以证明，保守跳过），供任务级汇总与可观测性区分。
-    if already_present(norm_msg, own_last_text, list_state, own_state):
-        if own_state == "unknown":
-            logger.warning(
-                f"账号 {username} 无法证明本人气泡属于今天"
-                f"（列表时间 {before_ts!r} / 本人气泡时间 {own_raw_ts!r}），保守跳过避免重复"
-            )
-            return "uncertain_skip", "无法证明本人气泡属于今天，保守跳过"
+    # 三态去重：只有「本人今天已发过同内容」才跳过；读取失败/证据冲突/无法证明属于今天
+    # 的也保守跳过（宁漏发也绝不重复发）。返回 send / dedup_skip（确定重复）/ uncertain_skip
+    # （读取失败或证据冲突或无法证明，保守跳过），供任务级汇总与可观测性区分。
+    verdict = already_present(norm_msg, own_last_text, own_read_ok, list_state, own_state)
+    if verdict == "dedup_skip":
         logger.warning(f"账号 {username} 今天已向该会话发送过相同内容，跳过避免重复")
         return "dedup_skip", "今天已发送过相同内容，跳过避免重复"
+    if verdict == "uncertain_skip":
+        if not own_read_ok:
+            reason = "无法读取本人气泡，无法排除已发同内容"
+        elif own_state == "today":
+            reason = "本人气泡时间(今天)与会话列表时间(非今天)冲突"
+        else:
+            reason = "无法证明本人气泡属于今天"
+        logger.warning(
+            f"账号 {username} {reason}"
+            f"（列表时间 {before_ts!r} / 本人气泡时间 {own_raw_ts!r}），保守跳过避免重复"
+        )
+        return "uncertain_skip", f"{reason}，保守跳过"
 
     lines = message.replace("\\\\n", chr(10)).splitlines() or [message]
     for index, line in enumerate(lines):
@@ -1271,9 +1309,18 @@ def do_user_task(browser, username, cookies, targets):
                 else:
                     not_found.append(target_id)
                     logger.warning(f"账号 {username} 向 {target_id} 发送失败: {detail}")
-            except LoginRequired:
-                logger.warning(f"账号 {username} 检测到安全验证，中止该账号")
-                break
+            except LoginRequired as e:
+                # 安全验证必须让本次运行非 0 退出（异常必须可见）：此前目标即使全部成功
+                # 也不能掩盖账号级安全事件。重新抛出，由 runTasks 统一置 failed 并记录，
+                # 顺带在日志里列出尚未处理的目标，避免静默丢任务。
+                remaining = [
+                    t["id"] for t in targets if f"{username}|{t['id']}" not in attempted
+                ]
+                logger.warning(
+                    f"账号 {username} 检测到安全验证，中止该账号并上报: {e}"
+                    f"（未处理目标 {remaining}）"
+                )
+                raise
             except Exception as e:
                 logger.warning(f"账号 {username} 给 {target_id} 发消息失败: {e}")
                 not_found.append(target_id)
