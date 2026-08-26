@@ -23,6 +23,7 @@ from core.tasks import (
     already_present,
     confirm_signals,
     _date_state,
+    list_preview_shows_same_today,
 )
 
 # 北京时区（与 tasks.CN_TZ 一致：UTC+8，无夏令时）
@@ -206,6 +207,42 @@ class TestAlreadyPresent(unittest.TestCase):
             already_present("今日火花", "[盖瑞]今日火花[加一]", True, "today", "nottoday"),
             "send",
         )
+
+
+class TestListPreviewShowsSameToday(unittest.TestCase):
+    """列表预览兜底去重：预览内容 == 将发模板 且 列表时间 = 今天 -> 本人今天已发。
+
+    独立于消息面板渲染（虚拟列表可能未渲染最新本人气泡，而列表条目是会话级权威状态）。
+    只有本自动化会向这些会话写入该模板，故「预览==模板 且 今天」即可证明本人今天已发。
+    """
+
+    def test_today_same_preview_confirms(self):
+        # 今天 00:07 已发 🔥、对方未回复 -> 列表预览=🔥、时间=今天 -> 本人今天已发
+        self.assertTrue(list_preview_shows_same_today("🔥", "today", "🔥"))
+        self.assertTrue(list_preview_shows_same_today("🔥", "today", "  🔥 "))
+
+    def test_emoji_code_normalized(self):
+        # 预览保留表情码原文，归一后与模板一致
+        self.assertTrue(
+            list_preview_shows_same_today("今日火花", "today", "[盖瑞]今日火花[加一]")
+        )
+
+    def test_yesterday_same_preview_does_not_confirm(self):
+        # 昨天发的 🔥（列表时间=昨天）-> 今天必须照发，绝不误跳过
+        self.assertFalse(list_preview_shows_same_today("🔥", "nottoday", "🔥"))
+
+    def test_unknown_time_does_not_confirm(self):
+        self.assertFalse(list_preview_shows_same_today("🔥", "unknown", "🔥"))
+
+    def test_different_preview_does_not_confirm(self):
+        # 对方今天回复了别的消息 -> 预览≠模板，不能据此判定已发（交给面板本人气泡判定）
+        self.assertFalse(list_preview_shows_same_today("🔥", "today", "晚安"))
+        self.assertFalse(list_preview_shows_same_today("🔥", "today", ""))
+
+    def test_today_same_preview_wins_over_panel_inconclusive(self):
+        # 即使面板本人气泡读不到（own_state=unknown），列表今天预览=模板仍应去重跳过
+        # （这正是 read_newest_own_bubble 修复前同天二次运行重复发的兜底防线）
+        self.assertTrue(list_preview_shows_same_today("🔥", "today", "🔥"))
 
 
 class TestConfirmSignals(unittest.TestCase):
