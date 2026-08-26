@@ -643,7 +643,9 @@ def select_by_virtual_list(page, username, target, item_selector, userIDDict=Non
     1. 目标任一别名（含 userIDDict 动态别名）在可见窗口中精确匹配 -> 点击返回（最高优先）
     2. 连续多轮「可见标题窗口不变 且 已见集合不再增长」-> 判定不可见并停止
 
-    找不到滚动容器/目标 -> 只跳过该目标（返回 not_found），继续下一个目标，绝不猜测点击。
+    返回 (el, title, degraded)。找不到滚动容器（页面降级：搜索/滚动都不可用）-> degraded=True，
+    调用方应重载 /chat 后重试一次该目标（重载只重新导航，未对该目标发过消息，安全）。
+    找不到目标本身 -> (None, None, False)，只跳过该目标，继续下一个，绝不猜测点击。
     页面级不可用由 wait_for_chat_ready 抛 ChatUnavailable 负责（列表根本未渲染时才中止账号）。
     """
     userIDDict = userIDDict or {}
@@ -652,7 +654,7 @@ def select_by_virtual_list(page, username, target, item_selector, userIDDict=Non
         scroller = _fallback_list_scroller(page)
     if scroller is None:
         logger.warning(f"账号 {username} 未找到可滚动容器，滚动兜底跳过目标 {target['id']}")
-        return None, None
+        return None, None, True
     try:
         scroller.hover()  # 悬停有助于部分虚拟列表加载；scrollTop 直滚不依赖它
     except Exception:
@@ -680,13 +682,13 @@ def select_by_virtual_list(page, username, target, item_selector, userIDDict=Non
 
         el, title = exact_visible_item(page, item_selector, wanted_set)
         if el is not None:
-            return el, title
+            return el, title, False
 
         # 滚动前先等一拍再复查：给 user/info 被动捕获留时间，避免「目标滚进视口但映射还没到」就被滚过头
         time.sleep(1.0)
         el, title = exact_visible_item(page, item_selector, wanted_set)
         if el is not None:
-            return el, title
+            return el, title, False
 
         try:
             scroller.evaluate("el => el.scrollTop += 620")
@@ -723,7 +725,7 @@ def select_by_virtual_list(page, username, target, item_selector, userIDDict=Non
             break
 
     logger.warning(f"账号 {username} 滚动结束仍未找到目标 {target['id']}")
-    return None, None
+    return None, None, False
 
 
 def _ensure_list_visible(page):
@@ -754,7 +756,10 @@ def _ensure_list_visible(page):
 
 
 def select_target(page, username, target, item_selector, search, userIDDict=None):
-    """主路径：搜索框精确筛选；兜底：滚动。找到并点击后返回 (True, title)，否则 (False, None)。
+    """主路径：搜索框精确筛选；兜底：滚动。返回 (found, title, degraded)。
+
+    degraded=True 表示页面处于降级态（找不到可滚动容器，搜索+滚动都不可用），调用方应
+    重载 /chat 后重试一次该目标；纯找不到目标则是 (False, None, False)。
 
     搜索后会话列表被 SearchPanel 覆盖为 hidden，命中项在 .SearchPanelitembox 里；
     点 .SearchPanelitemchat_btn 才会真正进入会话（真实 DOM 验证）。已删除全页 get_by_text 兜底。
@@ -800,10 +805,10 @@ def select_target(page, username, target, item_selector, search, userIDDict=None
                         btn.click()
                     else:
                         el.click()
-                    return True, title
+                    return True, title, False
                 except Exception as e:
                     logger.warning(f"账号 {username} 点击好友 {target['id']} 失败: {e}")
-                    return False, None
+                    return False, None, False
             # 无精确命中：记录 SearchPanel 结果标题（限量、截断），用于诊断目标格式是否匹配
             try:
                 titles = []
@@ -824,10 +829,10 @@ def select_target(page, username, target, item_selector, search, userIDDict=None
             if el is not None:
                 try:
                     el.click()
-                    return True, title
+                    return True, title, False
                 except Exception as e:
                     logger.warning(f"账号 {username} 点击好友 {target['id']} 失败: {e}")
-                    return False, None
+                    return False, None, False
             try:
                 search.fill("")
             except Exception:
@@ -837,15 +842,17 @@ def select_target(page, username, target, item_selector, search, userIDDict=None
     # 搜索未命中时可能留下 SearchPanel 遮挡列表（列表被置 hidden，滚动兜底找不到容器），
     # 滚动前先恢复列表可见
     _ensure_list_visible(page)
-    el, title = select_by_virtual_list(page, username, target, item_selector, userIDDict)
+    el, title, degraded = select_by_virtual_list(
+        page, username, target, item_selector, userIDDict
+    )
     if el is not None:
         try:
             el.click()
-            return True, title
+            return True, title, False
         except Exception as e:
             logger.warning(f"账号 {username} 点击好友 {target['id']} 失败: {e}")
-            return False, None
-    return False, None
+            return False, None, False
+    return False, None, degraded
 
 
 def read_chat_header_title(page, wait_seconds=5):
@@ -1236,6 +1243,9 @@ def do_user_task(browser, username, cookies, targets):
         uncertain_skip = []
         dry_matched = []
         attempted = set()  # 当次运行内 at-most-once：同一 账号+目标 只尝试一次，绝不自动重发
+        # 页面降级重载：每账号最多一次。00:07 实测 /chat 页面可能降级（列表不可滚动、
+        # 搜索不可用），导致只有顶部可见的少数会话能发。重载 /chat 重新渲染后再重试。
+        page_reloaded = False
         for target in targets:
             target_id = target["id"]
             key = f"{username}|{target_id}"
@@ -1244,16 +1254,51 @@ def do_user_task(browser, username, cookies, targets):
                 continue
             attempted.add(key)
 
-            try:
-                found, title = select_target(page, username, target, item_selector, search, userIDDict)
-            except LoginRequired:
-                raise
-            except ChatUnavailable:
-                # 列表不可用不是单个目标的临时失败，而是整账号不可用，立即中止
-                raise
-            except Exception as e:
-                logger.warning(f"账号 {username} 选择好友 {target_id} 出错: {e}")
-                found, title = False, None
+            # 页面降级恢复：找不到目标时，若页面处于降级态（无滚动容器、搜索+滚动都不可用），
+            # 重载 /chat 重新渲染后重试一次该目标。每账号最多重载一次；重载只重新导航，
+            # 未对该目标发过消息，安全（重载后 send_chat_message 的三态去重仍防重发已发目标）。
+            while True:
+                try:
+                    found, title, degraded = select_target(
+                        page, username, target, item_selector, search, userIDDict
+                    )
+                except LoginRequired:
+                    raise
+                except ChatUnavailable:
+                    # 列表不可用不是单个目标的临时失败，而是整账号不可用，立即中止
+                    raise
+                except Exception as e:
+                    logger.warning(f"账号 {username} 选择好友 {target_id} 出错: {e}")
+                    found, title, degraded = False, None, False
+                if found:
+                    break
+                if degraded and not page_reloaded:
+                    page_reloaded = True
+                    logger.warning(
+                        f"账号 {username} 检测到页面降级（找不到可滚动容器/搜索不可用），"
+                        f"重载 /chat 后重试目标 {target_id}"
+                    )
+                    try:
+                        retry_operation(
+                            "重载抖音网页聊天页面",
+                            page.goto,
+                            retries=1,
+                            delay=3,
+                            url="https://www.douyin.com/chat",
+                            wait_until="domcontentloaded",
+                            timeout=min(config["browserTimeout"], 60000),
+                        )
+                        wait_for_chat_ready(page, username)
+                        item_selector = resolve_item_selector(page)
+                        search = find_search_box(page, username)
+                        continue  # 重试当前目标（不重复标记 not_found）
+                    except LoginRequired:
+                        raise
+                    except ChatUnavailable:
+                        raise
+                    except Exception as e:
+                        logger.warning(f"账号 {username} 重载/重试失败: {e}")
+                break
 
             if not found:
                 not_found.append(target_id)
