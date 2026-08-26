@@ -1039,29 +1039,80 @@ LAST_OUTGOING_TS_JS = r"""
 """
 
 
+def read_newest_own_bubble(page, outgoing_sel):
+    """读面板中「最新」一条本人气泡，返回 (text, raw_ts, read_ok)。
+
+    实测 .MessageItemTextisFromMe 命中的元素在 DOM 中按「新→旧」排列（抖音虚拟列表最新在前），
+    且可能夹带空文本容器（撤回/异常占位，inner_text='' 但关联旧时间戳）。历史实现取
+    nth(cnt-1)（DOM 最后一个 = 最旧/空容器），导致去重从未生效、同天二次运行必然重复发送。
+    这里从索引 0（最新）起取第一条「文本与时间戳均非空」的元素：
+    - 无任何本人气泡（count==0）-> ('', '', True)：面板确认无本人气泡，调用方按「非重复」放行
+    - inner_text/evaluate 异常 -> ('', '', False)：读取失败，调用方必须保守（宁漏发）
+    - 全部为空 -> 返回索引 0 的原始读数（text 可能为 ''，调用方自行判定）
+    """
+    try:
+        cnt = page.locator(outgoing_sel).count()
+    except Exception:
+        return "", "", False
+    if cnt == 0:
+        return "", "", True
+    for idx in range(cnt):
+        loc = page.locator(outgoing_sel).nth(idx)
+        try:
+            text = norm(loc.inner_text(timeout=2000))
+        except Exception:
+            return "", "", False
+        try:
+            raw = (
+                loc.evaluate(LAST_OUTGOING_TS_JS, ",".join(MESSAGE_PANEL_TS_SELECTORS))
+                or ""
+            ).strip()
+        except Exception:
+            raw = ""
+        if text and raw:
+            return text, raw, True
+    # 全部空文本/空时间戳：返回最新一条（索引 0）的原始读数，语义交回调用方
+    try:
+        first = page.locator(outgoing_sel).nth(0)
+        text = norm(first.inner_text(timeout=2000))
+        raw = (
+            first.evaluate(LAST_OUTGOING_TS_JS, ",".join(MESSAGE_PANEL_TS_SELECTORS))
+            or ""
+        ).strip()
+        return text, raw, True
+    except Exception:
+        return "", "", False
+
+
 def read_last_outgoing_date(page, outgoing_sel):
-    """读最后一条本人气泡关联的时间戳文本，用于可靠判定「本人今天是否已发」。
+    """读最新一条本人气泡关联的时间戳文本，用于可靠判定「本人今天是否已发」。
 
     只读时间文本（6分钟前 / 10:04 / 昨天 19:58 ...），绝不读消息正文。返回 (state, raw_ts)：
     - 面板没有本人气泡 / 选择器失效 / JS 读不到 -> ("unknown", "")（宁漏发）；
     - 时间文本再交给 _date_state 做三态判定。
     注意与 read_conversation_item_state 的区别：列表时间是「会话最后一条消息」的时间，
     可能是对方今天回复；这里取的是本人气泡自己的时间戳（最近的前置时间节点）。
+    修正：DOM 中本人气泡按新→旧排列，取索引 0（最新）而非 nth(cnt-1)（最旧/空容器）。
     """
-    try:
-        cnt = page.locator(outgoing_sel).count()
-        if cnt == 0:
-            return "unknown", ""
-        last = page.locator(outgoing_sel).nth(cnt - 1)
-        if not last.is_visible():
-            # 气泡不在可视区（虚拟列表未渲染）读不到可靠时间，宁漏发
-            return "unknown", ""
-        raw = (last.evaluate(LAST_OUTGOING_TS_JS, ",".join(MESSAGE_PANEL_TS_SELECTORS)) or "").strip()
-        if not raw:
-            return "unknown", ""
-        return _date_state(raw), raw
-    except Exception:
+    _, raw, read_ok = read_newest_own_bubble(page, outgoing_sel)
+    if not read_ok or not raw:
         return "unknown", ""
+    return _date_state(raw), raw
+
+
+def list_preview_shows_same_today(norm_msg, list_state, before_preview):
+    """列表预览兜底去重（纯逻辑）：本会话最后一条消息「今天」就是本模板。
+
+    只有本自动化会向这些会话写入该模板，故「预览内容 == 将发内容 且 列表时间 = 今天」即可
+    证明本人今天已发，即使面板本人气泡读取不可靠（虚拟列表未渲染最新气泡）也直接跳过——
+    宁可漏发也绝不重复发。风险方向是误跳过（对方今天恰好也发了同模板），属可接受方向。
+    返回 bool。
+    """
+    return bool(
+        list_state == "today"
+        and before_preview
+        and visible_compact(before_preview) == visible_compact(norm_msg)
+    )
 
 
 def send_chat_message(page, username, target, config, item_selector):
@@ -1109,27 +1160,33 @@ def send_chat_message(page, username, target, config, item_selector):
     )
     list_state = _date_state(before_ts) if before_ts else "unknown"
 
-    # 本人上一条气泡文本 + 它在消息面板内自己的时间戳（可靠关联），真正用于判定
-    # 「本人今天是否已发过相同内容」。气泡文本读取必须区分「确认无本人气泡」与「读取
-    # 失败」：读取失败/未渲染时无法排除已发同内容，绝不能当「没发过」放行（宁漏发）。
-    own_last_text = ""
-    own_read_ok = True
-    try:
-        cnt = page.locator(outgoing_sel).count()
-        if cnt > 0:
-            own_last_text = norm(
-                page.locator(outgoing_sel).nth(cnt - 1).inner_text(timeout=2000)
-            )
-        # cnt == 0 -> 面板确实无本人气泡，own_read_ok 保持 True
-    except Exception:
-        own_read_ok = False
+    # 本人最新一条气泡文本 + 它在消息面板内自己的时间戳（可靠关联），真正用于判定
+    # 「本人今天是否已发过相同内容」。read_newest_own_bubble 从索引 0（DOM 新→旧）取最新
+    # 本人气泡，跳过空容器——历史取 nth(cnt-1)（最旧/空）导致去重从未生效、同天二次运行
+    # 必然重复发送。气泡文本读取必须区分「确认无本人气泡」与「读取失败」：读取失败/未渲染
+    # 时无法排除已发同内容，绝不能当「没发过」放行（宁漏发）。
+    own_last_text, own_raw_ts, own_read_ok = read_newest_own_bubble(page, outgoing_sel)
+    if not own_read_ok:
         logger.warning(f"账号 {username} 无法读取本人气泡（选择器 {outgoing_sel!r}），保守判定")
-    own_state, own_raw_ts = read_last_outgoing_date(page, outgoing_sel)
+    own_state = _date_state(own_raw_ts) if own_raw_ts else "unknown"
 
     # 三态去重：只有「本人今天已发过同内容」才跳过；读取失败/证据冲突/无法证明属于今天
     # 的也保守跳过（宁漏发也绝不重复发）。返回 send / dedup_skip（确定重复）/ uncertain_skip
     # （读取失败或证据冲突或无法证明，保守跳过），供任务级汇总与可观测性区分。
     verdict = already_present(norm_msg, own_last_text, own_read_ok, list_state, own_state)
+
+    # 列表预览兜底信号（独立于面板渲染）：本会话最后一条消息今天就是本模板 🔥。
+    # 只有本自动化会向这些会话写入该模板，故「预览==模板 且 时间=今天」即证明本人今天已发，
+    # 即使面板本人气泡读取不可靠也直接跳过（宁可漏发也绝不重复发）。仅当面板证据未判重复时
+    # 才叠加此信号，不会扩大误跳过面。
+    if verdict != "dedup_skip" and list_preview_shows_same_today(
+        norm_msg, list_state, before_preview
+    ):
+        verdict = "dedup_skip"
+        logger.warning(
+            f"账号 {username} 列表预览显示今天已发送过相同内容，跳过避免重复"
+            f"（列表时间 {before_ts!r} / 预览 {before_preview!r}）"
+        )
     if verdict == "dedup_skip":
         logger.warning(f"账号 {username} 今天已向该会话发送过相同内容，跳过避免重复")
         return "dedup_skip", "今天已发送过相同内容，跳过避免重复"
@@ -1163,15 +1220,8 @@ def send_chat_message(page, username, target, config, item_selector):
             now_ts, now_preview, _ = read_conversation_item_state(
                 page, item_selector, wanted_set
             )
-            bubble_last = ""
-            cnt = page.locator(outgoing_sel).count()
-            if cnt > 0:
-                try:
-                    bubble_last = norm(
-                        page.locator(outgoing_sel).nth(cnt - 1).inner_text(timeout=2000)
-                    )
-                except Exception:
-                    bubble_last = ""
+            # 气泡兜底确认同样取索引 0（最新本人气泡），DOM 新→旧排列
+            bubble_last, _, _ = read_newest_own_bubble(page, outgoing_sel)
             if confirm_signals(
                 norm_msg, before_ts, before_preview, now_ts, now_preview, bubble_last
             ):
