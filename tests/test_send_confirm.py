@@ -23,6 +23,7 @@ from core.tasks import (
     already_present,
     confirm_signals,
     _date_state,
+    panel_proves_not_sent_today,
     list_preview_shows_same_today,
 )
 
@@ -103,6 +104,35 @@ class TestDateState(unittest.TestCase):
         self.assertEqual(_date_state(None), "unknown")
         self.assertEqual(_date_state("   "), "unknown")
         self.assertEqual(_date_state("乱七八糟"), "unknown")
+
+    def test_weekday_labels(self):
+        # 抖音只对「最近 7 天内、且不是今天/昨天/前天」的消息显示周几，故周几要么是今天、
+        # 要么必为更早。2026-09-29 是周二。历史实现漏解析周几：'周四' -> unknown ->
+        # 面板明明显示本人上一条 🔥 是周四发的，却被「无法证明本人气泡属于今天」保守跳过。
+        tue = BJ(2026, 9, 29, 9, 20)
+        self.assertEqual(_date_state("周四", tue), "nottoday")
+        self.assertEqual(_date_state("星期五", tue), "nottoday")
+        self.assertEqual(_date_state("礼拜六", tue), "nottoday")
+        self.assertEqual(_date_state("周日", tue), "nottoday")
+
+    def test_weekday_label_equal_to_today_is_today(self):
+        # 标签恰好等于今天的星期 -> today（保守方向：宁可漏发也不重复发）
+        tue = BJ(2026, 9, 29, 9, 20)
+        self.assertEqual(_date_state("周二", tue), "today")
+        self.assertEqual(_date_state("星期二", tue), "today")
+        self.assertEqual(_date_state("礼拜二", tue), "today")
+
+    def test_weekday_sunday_alias_and_other_weekday(self):
+        # 周日也写作「周天」；以周日为今天时 周一..周六 全部为 nottoday
+        sun = BJ(2026, 9, 27, 9, 20)
+        self.assertEqual(_date_state("周天", sun), "today")
+        self.assertEqual(_date_state("周日", sun), "today")
+        self.assertEqual(_date_state("周一", sun), "nottoday")
+
+    def test_weekday_does_not_swallow_other_text(self):
+        # 只认「周X/星期X/礼拜X」整体，不误伤含「周」的其他文本
+        self.assertEqual(_date_state("上周三", BJ(2026, 9, 29, 9, 20)), "unknown")
+        self.assertEqual(_date_state("周四 10:04", BJ(2026, 9, 29, 9, 20)), "unknown")
 
 
 class TestVisibleCompact(unittest.TestCase):
@@ -210,10 +240,12 @@ class TestAlreadyPresent(unittest.TestCase):
 
 
 class TestListPreviewShowsSameToday(unittest.TestCase):
-    """列表预览兜底去重：预览内容 == 将发模板 且 列表时间 = 今天 -> 本人今天已发。
+    """列表预览兜底去重：预览内容 == 将发模板 且 列表时间 = 今天。
 
-    独立于消息面板渲染（虚拟列表可能未渲染最新本人气泡，而列表条目是会话级权威状态）。
-    只有本自动化会向这些会话写入该模板，故「预览==模板 且 今天」即可证明本人今天已发。
+    【2026-09-29 更正】本类只测函数本身。它原先的依据「只有本自动化会向这些会话写入该
+    模板」已被实测证伪（对方也会先发 🔥），且列表预览不带发送者归属。因此它**不能单独
+    判定本人已发**——调用方必须先用 panel_proves_not_sent_today 排除「面板已证明今天
+    没发」，见 TestPanelProvesNotSentToday。
     """
 
     def test_today_same_preview_confirms(self):
@@ -243,6 +275,47 @@ class TestListPreviewShowsSameToday(unittest.TestCase):
         # 即使面板本人气泡读不到（own_state=unknown），列表今天预览=模板仍应去重跳过
         # （这正是 read_newest_own_bubble 修复前同天二次运行重复发的兜底防线）
         self.assertTrue(list_preview_shows_same_today("🔥", "today", "🔥"))
+
+
+class TestPanelProvesNotSentToday(unittest.TestCase):
+    """面板归属证据：本人最新气泡就是本模板、且明确属非今天 -> 证明今天没发，必须照发。
+
+    回归 2026-09-28/09-29 连续漏发 无(林狗)：对方当天先发了 🔥，列表预览与时间随之变成
+    「🔥 / 今天」，于是无归属的 list_preview_shows_same_today 把面板已经判定的 send 否决成
+    dedup_skip。本函数就是用来阻止那次否决的门。
+    """
+
+    def test_own_bubble_same_content_nottoday_proves_not_sent(self):
+        # 实测场景：无(林狗) 会话里本人最新气泡 = '🔥'、时间戳 '前天' -> 今天该发
+        self.assertTrue(panel_proves_not_sent_today("🔥", "🔥", True, "nottoday"))
+        self.assertTrue(panel_proves_not_sent_today("🔥", "  🔥 ", True, "nottoday"))
+
+    def test_own_bubble_today_does_not_prove_not_sent(self):
+        # 本人今天已发同内容 -> 不能证明「没发」，去重必须仍然生效
+        self.assertFalse(panel_proves_not_sent_today("🔥", "🔥", True, "today"))
+
+    def test_own_bubble_unknown_date_does_not_prove_not_sent(self):
+        # 本人气泡时间读不出自然日 -> 无从证明，保持保守（由 already_present 判 uncertain_skip）
+        self.assertFalse(panel_proves_not_sent_today("🔥", "🔥", True, "unknown"))
+
+    def test_read_failure_does_not_prove_not_sent(self):
+        # 面板读取失败 -> 绝不放行，列表预览兜底必须继续生效（宁漏发）
+        self.assertFalse(panel_proves_not_sent_today("🔥", "🔥", False, "nottoday"))
+        self.assertFalse(panel_proves_not_sent_today("🔥", "", False, "nottoday"))
+
+    def test_empty_own_bubble_does_not_prove_not_sent(self):
+        # 读出成功但本人气泡文本为空（可能渲染成空容器）-> 归属证据不成立，兜底继续生效
+        self.assertFalse(panel_proves_not_sent_today("🔥", "", True, "unknown"))
+        self.assertFalse(panel_proves_not_sent_today("🔥", "", True, "today"))
+
+    def test_different_content_does_not_prove_not_sent(self):
+        # 本人最新气泡不是本模板 -> 不能证明「今天没发过本模板」，兜底继续生效
+        self.assertFalse(panel_proves_not_sent_today("🔥", "晚安", True, "nottoday"))
+
+    def test_emoji_code_normalized(self):
+        self.assertTrue(
+            panel_proves_not_sent_today("今日火花", "[盖瑞]今日火花[加一]", True, "nottoday")
+        )
 
 
 class TestConfirmSignals(unittest.TestCase):

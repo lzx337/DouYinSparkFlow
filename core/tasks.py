@@ -937,6 +937,16 @@ def _date_state(ts, now=None):
     if "昨天" in s or "前天" in s:
         return "nottoday"
 
+    # 周几：抖音只对「最近 7 天内、且不是今天/昨天/前天」的消息显示周几（周X / 星期X /
+    # 礼拜X，周日也写作周天）。因此周几标签要么就是今天、要么必为更早，可可靠判定自然日：
+    # 等于今天的星期 -> today（保守，宁漏发），否则一律 nottoday。
+    # 历史实现漏解析周几，2026-09-29（周二）把本人气泡时间戳 '周四' 判成 unknown，导致
+    # 目标 Meteor.💫(梁亚楠男友) 被「无法证明本人气泡属于今天」保守跳过、当天漏发。
+    m = re.match(r"^(?:周|星期|礼拜)([一二三四五六日天])$", s)
+    if m:
+        ch = "日" if m.group(1) == "天" else m.group(1)
+        return "today" if "一二三四五六日".index(ch) + 1 == now.isoweekday() else "nottoday"
+
     # 显式日期：YYYY年M月D日 / YYYY-MM-DD / YYYY/M/D
     for fmt in ("%Y年%m月%d日", "%Y-%m-%d", "%Y/%m/%d"):
         try:
@@ -1100,12 +1110,39 @@ def read_last_outgoing_date(page, outgoing_sel):
     return _date_state(raw), raw
 
 
+def panel_proves_not_sent_today(norm_msg, own_last_text, own_read_ok, own_state):
+    """面板是否已【带发送者归属地】证明本人今天没发过将发内容（纯逻辑）。
+
+    与列表预览的关键区别：本人气泡（.MessageItemTextisFromMe）是**有归属**的证据——它
+    确定是本人发的，且带有自己的时间戳；列表预览只显示会话最后一条消息，不带归属。
+
+    条件（全部满足才算证明）：
+    - own_read_ok：本人气泡确实读到了（读取失败则无从证明，必须继续保守）；
+    - own_last_text 非空：确实读出了本人最新一条气泡的内容；
+    - 内容归一后 == 将发内容：本人最近一次发的就是本模板；
+    - own_state == 'nottoday'：那条本模板气泡明确属于非今天。
+    此时「本人今天没发过本模板」成立，列表预览里今天的同内容必然出自对方（续火花本就双向，
+    对方先发 🔥 很常见），绝不能据此跳过。返回 bool。
+
+    2026-09-29 实测：无(林狗) 会话内对方发 9 条 🔥、本人仅 1 条（前天），面板判定 send 却
+    被无归属的列表预览否决，连续两天漏发。
+    """
+    return bool(
+        own_read_ok
+        and own_last_text
+        and visible_compact(own_last_text) == visible_compact(norm_msg)
+        and own_state == "nottoday"
+    )
+
+
 def list_preview_shows_same_today(norm_msg, list_state, before_preview):
     """列表预览兜底去重（纯逻辑）：本会话最后一条消息「今天」就是本模板。
 
-    只有本自动化会向这些会话写入该模板，故「预览内容 == 将发内容 且 列表时间 = 今天」即可
-    证明本人今天已发，即使面板本人气泡读取不可靠（虚拟列表未渲染最新气泡）也直接跳过——
-    宁可漏发也绝不重复发。风险方向是误跳过（对方今天恰好也发了同模板），属可接受方向。
+    【2026-09-29 更正】此处原先假定「只有本自动化会向这些会话写入该模板」，据此认为
+    「预览内容 == 将发内容 且 列表时间 = 今天」即证明本人今天已发。**该假定已被实测证伪**：
+    续火花是双向的，对方也会先发同模板。列表预览不带发送者归属，读到的内容完全可能是对方的。
+    故本函数只有在面板拿不到归属证据时（读取失败 / 未读出本人气泡）才有参考价值，调用方
+    必须先用 panel_proves_not_sent_today 排除「面板已证明今天没发」的情形，否则会误跳过。
     返回 bool。
     """
     return bool(
@@ -1176,16 +1213,22 @@ def send_chat_message(page, username, target, config, item_selector):
     verdict = already_present(norm_msg, own_last_text, own_read_ok, list_state, own_state)
 
     # 列表预览兜底信号（独立于面板渲染）：本会话最后一条消息今天就是本模板 🔥。
-    # 只有本自动化会向这些会话写入该模板，故「预览==模板 且 时间=今天」即证明本人今天已发，
-    # 即使面板本人气泡读取不可靠也直接跳过（宁可漏发也绝不重复发）。仅当面板证据未判重复时
-    # 才叠加此信号，不会扩大误跳过面。
-    if verdict != "dedup_skip" and list_preview_shows_same_today(
-        norm_msg, list_state, before_preview
+    # 仅在面板【拿不到归属证据】时生效——那正是它被设计出来兜的场景。一旦面板成功读到本人
+    # 最新气泡、内容就是本模板、且归属明确为非今天（panel_proves_not_sent_today），就以
+    # 归属证据为准，不再让无归属的列表预览否决它。这正是 already_present 的既定契约：
+    # 列表时间只用于「明确非今天 -> 放行」的保守方向，绝不单独判定「已发」。
+    if (
+        not panel_proves_not_sent_today(
+            norm_msg, own_last_text, own_read_ok, own_state
+        )
+        and verdict != "dedup_skip"
+        and list_preview_shows_same_today(norm_msg, list_state, before_preview)
     ):
         verdict = "dedup_skip"
         logger.warning(
             f"账号 {username} 列表预览显示今天已发送过相同内容，跳过避免重复"
-            f"（列表时间 {before_ts!r} / 预览 {before_preview!r}）"
+            f"（列表时间 {before_ts!r} / 预览 {before_preview!r} / "
+            f"本人气泡读取成功={own_read_ok!r} / 本人气泡时间 {own_raw_ts!r}）"
         )
     if verdict == "dedup_skip":
         logger.warning(f"账号 {username} 今天已向该会话发送过相同内容，跳过避免重复")
